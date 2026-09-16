@@ -6,6 +6,7 @@ class UserModel {
   final bool isVendor;
   final double? latitude;
   final double? longitude;
+  final DateTime? lastSeen; // Opcional: útil para saber actividad reciente del usuario
 
   UserModel({
     required this.id,
@@ -15,9 +16,10 @@ class UserModel {
     this.isVendor = false,
     this.latitude,
     this.longitude,
+    this.lastSeen,
   });
 
-  // Convertir a JSON para futuras bases de datos
+  // Convertir a JSON para bases de datos (Firestore)
   Map<String, dynamic> toJson() {
     return {
       'id': id,
@@ -27,6 +29,7 @@ class UserModel {
       'isVendor': isVendor,
       'latitude': latitude,
       'longitude': longitude,
+      'lastSeen': lastSeen?.toIso8601String(),
     };
   }
 
@@ -40,6 +43,29 @@ class UserModel {
       isVendor: json['isVendor'] ?? false,
       latitude: json['latitude']?.toDouble(),
       longitude: json['longitude']?.toDouble(),
+      lastSeen: json['lastSeen'] != null ? DateTime.tryParse(json['lastSeen']) : null,
+    );
+  }
+
+  // Método copyWith para actualizar coordenadas o datos del usuario fácilmente
+  UserModel copyWith({
+    String? name,
+    String? email,
+    String? phone,
+    bool? isVendor,
+    double? latitude,
+    double? longitude,
+    DateTime? lastSeen,
+  }) {
+    return UserModel(
+      id: id,
+      name: name ?? this.name,
+      email: email ?? this.email,
+      phone: phone ?? this.phone,
+      isVendor: isVendor ?? this.isVendor,
+      latitude: latitude ?? this.latitude,
+      longitude: longitude ?? this.longitude,
+      lastSeen: lastSeen ?? this.lastSeen,
     );
   }
 }

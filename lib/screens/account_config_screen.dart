@@ -2,9 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:areaguardian/screens/auth/login.dart';
+import 'package:areaguardian/screens/auth/pick_location_map.dart'; // <--- CORREGIDO (faltaba el ;)
+import 'package:latlong2/latlong.dart';
 
 // ==========================================
-// PANTALLA DE PERFIL / CUENTA
+// PANTALLA DE PERFIL / CUENTA (DÚCTIL: CLIENTE / VENDEDOR)
 // ==========================================
 class AccountConfigScreen extends StatefulWidget {
   const AccountConfigScreen({super.key});
@@ -17,9 +19,9 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
   final _nameController = TextEditingController();
   final _contactController = TextEditingController();
   final _puestoController = TextEditingController();
-  final _addressController = TextEditingController();
 
   String _userEmail = '';
+  bool _isVendor = false; // <--- Identificador de rol
   bool _isLoading = false;
   bool _isSaved = false;
 
@@ -32,11 +34,11 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
   Future<void> _loadUserData() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      _nameController.text = prefs.getString('vendor_name') ?? '';
+      _nameController.text = prefs.getString('vendor_name') ?? prefs.getString('user_name') ?? '';
       _contactController.text = prefs.getString('contact') ?? '';
       _puestoController.text = prefs.getString('puesto_title') ?? '';
-      _addressController.text = prefs.getString('vendor_address') ?? '';
       _userEmail = prefs.getString('user_email') ?? 'usuario@areaguardian.com';
+      _isVendor = prefs.getBool('is_vendor') ?? true;
     });
   }
 
@@ -47,10 +49,16 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     }
     setState(() => _isLoading = true);
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('vendor_name', _nameController.text.trim());
+
+    if (_isVendor) {
+      await prefs.setString('vendor_name', _nameController.text.trim());
+      await prefs.setString('puesto_title', _puestoController.text.trim());
+    } else {
+      await prefs.setString('user_name', _nameController.text.trim());
+    }
+
     await prefs.setString('contact', _contactController.text.trim());
-    await prefs.setString('puesto_title', _puestoController.text.trim());
-    await prefs.setString('vendor_address', _addressController.text.trim());
+
     setState(() {
       _isLoading = false;
       _isSaved = true;
@@ -61,10 +69,7 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
   }
 
   // ==========================================
-  // FUNCIÓN PARA SELECCIONAR CONTACTO DE LA AGENDA
-  // ==========================================
-  // ==========================================
-  // FUNCIÓN PARA SELECCIONAR CONTACTO DE LA AGENDA
+  // SELECCIONAR CONTACTO DE LA AGENDA
   // ==========================================
   Future<void> _pickContactFromPhone() async {
     try {
@@ -74,28 +79,18 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
       if (status != PermissionStatus.granted &&
           status != PermissionStatus.limited) {
-        _showSnack(
-          'Permiso de contactos denegado',
-          isError: true,
-        );
+        _showSnack('Permiso de contactos denegado', isError: true);
         return;
       }
 
-      // Abrir selector de contactos y pedir directamente el teléfono
-      final Contact? contact =
-      await FlutterContacts.native.showPicker(
-        properties: {
-          ContactProperty.phone,
-        },
+      final Contact? contact = await FlutterContacts.native.showPicker(
+        properties: {ContactProperty.phone},
       );
 
       if (contact != null) {
         if (contact.phones.isNotEmpty) {
-          final String name =
-              contact.displayName ?? 'Sin nombre';
-
-          final String phone =
-              contact.phones.first.number;
+          final String name = contact.displayName ?? 'Sin nombre';
+          final String phone = contact.phones.first.number;
 
           setState(() {
             _contactController.text = '$name — $phone';
@@ -103,17 +98,29 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
           _showSnack('Contacto seleccionado correctamente');
         } else {
-          _showSnack(
-            'El contacto no tiene número registrado',
-            isError: true,
-          );
+          _showSnack('El contacto no tiene número registrado', isError: true);
         }
       }
     } catch (e) {
-      _showSnack(
-        'Error al acceder a los contactos: $e',
-        isError: true,
-      );
+      _showSnack('Error al acceder a los contactos: $e', isError: true);
+    }
+  }
+
+  // ==========================================
+  // NAVEGAR AL MAPA Y CAPTURAR NUEVA UBICACIÓN
+  // ==========================================
+  Future<void> _navigateToChangeLocation() async {
+    final LatLng? selectedLocation = await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => const PickLocationScreen()),
+    );
+
+    if (selectedLocation != null) {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setDouble('vendor_latitude', selectedLocation.latitude);
+      await prefs.setDouble('vendor_longitude', selectedLocation.longitude);
+
+      _showSnack('¡Ubicación del puesto actualizada en el mapa!');
     }
   }
 
@@ -176,7 +183,6 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     _nameController.dispose();
     _contactController.dispose();
     _puestoController.dispose();
-    _addressController.dispose();
     super.dispose();
   }
 
@@ -206,28 +212,22 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
                       hint: 'Ej: Carlos Cortés',
                     ),
                     const SizedBox(height: 12),
-
-                    // ==========================================
-                    // CAMPO DE CONTACTO CON BOTÓN DE AGENDA
-                    // ==========================================
                     _buildContactFieldWithPicker(),
 
-                    const SizedBox(height: 24),
-                    _buildSectionTitle('Información del puesto'),
-                    const SizedBox(height: 12),
-                    _buildField(
-                      controller: _puestoController,
-                      label: 'Nombre del puesto',
-                      icon: Icons.storefront_outlined,
-                      hint: 'Ej: Puesto 3 - Variedades',
-                    ),
-                    const SizedBox(height: 12),
-                    _buildField(
-                      controller: _addressController,
-                      label: 'Dirección o sector',
-                      icon: Icons.location_on_outlined,
-                      hint: 'Ej: Carrera 96H #17 (Parque Central)',
-                    ),
+                    if (_isVendor) ...[
+                      const SizedBox(height: 24),
+                      _buildSectionTitle('Información del puesto'),
+                      const SizedBox(height: 12),
+                      _buildField(
+                        controller: _puestoController,
+                        label: 'Nombre del puesto',
+                        icon: Icons.storefront_outlined,
+                        hint: 'Ej: Puesto 3 - Variedades',
+                      ),
+                      const SizedBox(height: 12),
+                      _buildLocationPickerButton(),
+                    ],
+
                     const SizedBox(height: 28),
                     _buildSaveButton(),
                     const SizedBox(height: 16),
@@ -246,7 +246,6 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
-  // ── HEADER ────────────────────────────────────────────────────────────────
   Widget _buildHeader() {
     return Container(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
@@ -264,30 +263,26 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
             ),
           ),
           const Spacer(),
-          if (_isSaved)
-            Container(
-              padding:
-              const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-              decoration: BoxDecoration(
-                color: const Color(0xFF00E6A7).withOpacity(0.15),
-                borderRadius: BorderRadius.circular(20),
-              ),
-              child: const Row(
-                children: [
-                  Icon(Icons.check, color: Color(0xFF00E6A7), size: 14),
-                  SizedBox(width: 4),
-                  Text('Guardado',
-                      style: TextStyle(
-                          color: Color(0xFF00E6A7), fontSize: 12)),
-                ],
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            decoration: BoxDecoration(
+              color: (_isVendor ? const Color(0xFF00E6A7) : Colors.blueAccent).withOpacity(0.15),
+              borderRadius: BorderRadius.circular(20),
+            ),
+            child: Text(
+              _isVendor ? 'Puesto / Vendedor' : 'Cliente / Usuario',
+              style: TextStyle(
+                color: _isVendor ? const Color(0xFF00E6A7) : Colors.blueAccent,
+                fontSize: 11,
+                fontWeight: FontWeight.bold,
               ),
             ),
+          ),
         ],
       ),
     );
   }
 
-  // ── AVATAR ────────────────────────────────────────────────────────────────
   Widget _buildAvatar() {
     final initial = _nameController.text.isNotEmpty
         ? _nameController.text[0].toUpperCase()
@@ -338,7 +333,6 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
-  // ── SECCIÓN TÍTULO ────────────────────────────────────────────────────────
   Widget _buildSectionTitle(String title) {
     return Row(
       children: [
@@ -364,7 +358,6 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
-  // ── CAMPO DE TEXTO ESTÁNDAR ───────────────────────────────────────────────
   Widget _buildField({
     required TextEditingController controller,
     required String label,
@@ -406,7 +399,6 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
-  // ── CAMPO DE CONTACTO CON BOTÓN DE AGENDA INTEGRADO ──────────────────────
   Widget _buildContactFieldWithPicker() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -455,7 +447,36 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
-  // ── BOTÓN GUARDAR ─────────────────────────────────────────────────────────
+  Widget _buildLocationPickerButton() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Ubicación del puesto en el mapa',
+          style: TextStyle(color: Colors.white54, fontSize: 12),
+        ),
+        const SizedBox(height: 6),
+        SizedBox(
+          width: double.infinity,
+          height: 48,
+          child: OutlinedButton.icon(
+            style: OutlinedButton.styleFrom(
+              backgroundColor: const Color(0xFF1D2030),
+              side: BorderSide(color: const Color(0xFF00E6A7).withOpacity(0.3)),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+            ),
+            onPressed: _navigateToChangeLocation,
+            icon: const Icon(Icons.map_outlined, color: Color(0xFF00E6A7), size: 20),
+            label: const Text(
+              'Actualizar ubicación en el mapa',
+              style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildSaveButton() {
     return SizedBox(
       width: double.infinity,
@@ -485,7 +506,6 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
-  // ── TARJETA INFORMATIVA ───────────────────────────────────────────────────
   Widget _buildInfoCard() {
     return Container(
       padding: const EdgeInsets.all(14),
@@ -506,10 +526,12 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
                 color: Color(0xFF00E6A7), size: 18),
           ),
           const SizedBox(width: 12),
-          const Expanded(
+          Expanded(
             child: Text(
-              'Tu dirección se usa para marcar tu puesto en el mapa. Actualízala si cambias de ubicación.',
-              style: TextStyle(
+              _isVendor
+                  ? 'Tu perfil está configurado como Vendedor, por lo que participas activamente en la red de apoyo y alertas de la zona.'
+                  : 'Tu perfil está configurado como Cliente. Puedes activar alarmas de emergencia y tu contacto de confianza será notificado.',
+              style: const TextStyle(
                   color: Colors.white54, fontSize: 12, height: 1.4),
             ),
           ),
@@ -518,7 +540,6 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
-  // ── BOTÓN CERRAR SESIÓN ───────────────────────────────────────────────────
   Widget _buildLogoutButton() {
     return SizedBox(
       width: double.infinity,
@@ -540,7 +561,6 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
-  // ── VERSIÓN ───────────────────────────────────────────────────────────────
   Widget _buildVersionInfo() {
     return Center(
       child: Column(

@@ -6,13 +6,13 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
-// Importamos nuestros servicios y modelos de la arquitectura
+// Importamos servicios, modelos y Firestore
 import '../services/location_service.dart';
-import '../services/vendor_service.dart';
+import '../services/firestore_service.dart';
 import '../models/vendor_model.dart';
 
 // ==========================================
-// PANTALLA DE MAPA — OpenStreetMap (gratis)
+// PANTALLA DE MAPA — OpenStreetMap + Firestore
 // ==========================================
 class MapDashboardScreen extends StatefulWidget {
   const MapDashboardScreen({super.key});
@@ -24,7 +24,7 @@ class MapDashboardScreen extends StatefulWidget {
 class _MapDashboardScreenState extends State<MapDashboardScreen> {
   final MapController _mapController = MapController();
   final LocationService _locationService = LocationService();
-  final VendorService _vendorService = VendorService();
+  final FirestoreService _firestoreService = FirestoreService();
 
   LatLng? _myLocation;
   LatLng? _myPuestoLocation;
@@ -35,7 +35,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   String _myVendorName = '';
   String _myAddress = '';
 
-  // Lista de puestos dinámicos obtenidos desde el servicio
+  // Lista de puestos dinámicos obtenidos desde Firebase Firestore
   List<VendorModel> _puestosVecinos = [];
   VendorModel? _selectedVendorPuesto;
   bool _isMyPuestoSelected = false;
@@ -72,11 +72,8 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
         _myPuestoLocation = currentLatLng;
       });
 
-      // 3. Cargamos los vendedores cercanos usando el VendorService
-      List<VendorModel> vendors = await _vendorService.getNearbyVendors(
-        currentLatLng.latitude,
-        currentLatLng.longitude,
-      );
+      // 3. Consultamos los puestos reales directamente desde Firestore
+      List<VendorModel> vendors = await _firestoreService.fetchNearbyVendors();
 
       setState(() {
         _puestosVecinos = vendors;
@@ -229,7 +226,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                 ),
               ),
 
-            // Puestos vecinos (Vendedores de la red)
+            // Puestos de la red (Firestore)
             ..._puestosVecinos.map(
                   (puesto) => Marker(
                 point: LatLng(puesto.latitude, puesto.longitude),

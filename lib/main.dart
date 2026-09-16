@@ -1,10 +1,17 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart'; // 1. Importa Firebase Core
 import 'package:shared_preferences/shared_preferences.dart';
 import 'widgets/bar_nav.dart';
 import 'screens/auth/login.dart';
 import 'screens/auth/register.dart';
 
-void main() {
+void main() async { // 2. Se convierte en async
+  // 3. Obligatorio para asegurar la vinculación de widgets antes de inicializar servicios nativos
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // 4. Inicializa la conexión con Firebase
+  await Firebase.initializeApp();
+
   runApp(const AreaGuardianApp());
 }
 
