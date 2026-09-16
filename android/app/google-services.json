@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "967999112644",
+    "project_id": "areaguardian-78eb8",
+    "storage_bucket": "areaguardian-78eb8.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:967999112644:android:993e5600a4f8c030279091",
+        "android_client_info": {
+          "package_name": "com.example.areaguardian"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD1CDco2VhUD3SFZ_Rj6TJyjU6fJ0pSs0g"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

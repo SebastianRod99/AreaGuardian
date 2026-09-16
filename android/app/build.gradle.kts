@@ -1,7 +1,20 @@
 plugins {
     id("com.android.application")
+    id("com.google.gms.google-services")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+}
+
+dependencies {
+    // Import the Firebase BoM (Bill of Materials)
+    implementation(platform("com.google.firebase:firebase-bom:33.9.0"))
+
+    // Productos de Firebase que usará AreaGuardian:
+    implementation("com.google.firebase:firebase-analytics")
+
+    // 🔔 Esenciales para la red de alertas a puestos cercanos:
+    implementation("com.google.firebase:firebase-messaging") // Para notificaciones push (FCM)
+    implementation("com.google.firebase:firebase-firestore") // Para almacenar y buscar puestos/alertas cercanas
 }
 
 android {

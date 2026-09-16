@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'map_dashboard.dart';
+import 'package:areaguardian/screens/map_dashboard_screen.dart';
 import 'register.dart';
 
 // ==========================================

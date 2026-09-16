@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'screen/bar_nav.dart';
-import 'screen/login.dart';
-import 'screen/register.dart';
+import 'widgets/bar_nav.dart';
+import 'screens/auth/login.dart';
+import 'screens/auth/register.dart';
 
 void main() {
   runApp(const AreaGuardianApp());

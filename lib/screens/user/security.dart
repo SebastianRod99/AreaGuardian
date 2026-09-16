@@ -4,6 +4,7 @@ import 'dart:async';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 import 'emergency.dart'; // Importa tu servicio centralizado
+import 'package:vibration/vibration.dart';
 
 // ==========================================
 // PANTALLA DEDICADA DE SEGURIDAD (TAB 1)
@@ -92,6 +93,9 @@ class _SecurityScreenState extends State<SecurityScreen>
   }
 
   void _triggerAlarm() async {
+    if (await Vibration.hasVibrator() ?? false) {
+      Vibration.vibrate(duration: 500); // Vibra durante 500ms
+    }
     setState(() {
       isAlarmActive = true;
       shakeCount = 0;

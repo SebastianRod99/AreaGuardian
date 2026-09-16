@@ -6,6 +6,11 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+// Importamos nuestros servicios y modelos de la arquitectura
+import '../services/location_service.dart';
+import '../services/vendor_service.dart';
+import '../models/vendor_model.dart';
+
 // ==========================================
 // PANTALLA DE MAPA — OpenStreetMap (gratis)
 // ==========================================
@@ -18,6 +23,8 @@ class MapDashboardScreen extends StatefulWidget {
 
 class _MapDashboardScreenState extends State<MapDashboardScreen> {
   final MapController _mapController = MapController();
+  final LocationService _locationService = LocationService();
+  final VendorService _vendorService = VendorService();
 
   LatLng? _myLocation;
   LatLng? _myPuestoLocation;
@@ -28,93 +35,59 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   String _myVendorName = '';
   String _myAddress = '';
 
-  _Puesto? _selectedPuesto;
-
-  // Puestos simulados — reemplazar con Firestore o backend real
-  final List<_Puesto> _puestosVecinos = [
-    _Puesto(
-      id: '1',
-      title: 'Puesto 1',
-      vendorName: 'María López',
-      address: 'Carrera 96H #17-20',
-      location: const LatLng(4.6740, -74.1470),
-      isActive: true,
-    ),
-    _Puesto(
-      id: '2',
-      title: 'Puesto 2',
-      vendorName: 'Carlos Cortés',
-      address: 'Carrera 96H #17-35',
-      location: const LatLng(4.6745, -74.1460),
-      isActive: true,
-    ),
-    _Puesto(
-      id: '3',
-      title: 'Puesto 3',
-      vendorName: 'Ana García',
-      address: 'Calle 17 #96-10',
-      location: const LatLng(4.6735, -74.1480),
-      isActive: false,
-    ),
-    _Puesto(
-      id: '4',
-      title: 'Puesto 4',
-      vendorName: 'Juan Rojas',
-      address: 'Calle 17 #96-22',
-      location: const LatLng(4.6750, -74.1455),
-      isActive: true,
-    ),
-    _Puesto(
-      id: '5',
-      title: 'Puesto 5',
-      vendorName: 'Laura Méndez',
-      address: 'Carrera 96 #16-80',
-      location: const LatLng(4.6730, -74.1490),
-      isActive: false,
-    ),
-  ];
+  // Lista de puestos dinámicos obtenidos desde el servicio
+  List<VendorModel> _puestosVecinos = [];
+  VendorModel? _selectedVendorPuesto;
+  bool _isMyPuestoSelected = false;
 
   @override
   void initState() {
     super.initState();
-    _loadMyPuesto();
-    _getCurrentLocation();
+    _loadMyPuestoAndLocation();
   }
 
-  Future<void> _loadMyPuesto() async {
+  Future<void> _loadMyPuestoAndLocation() async {
+    // 1. Cargamos datos locales del puesto del usuario
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _myPuestoTitle = prefs.getString('puesto_title') ?? 'Mi Puesto';
       _myVendorName = prefs.getString('vendor_name') ?? '';
       _myAddress = prefs.getString('vendor_address') ?? '';
     });
-  }
 
-  Future<void> _getCurrentLocation() async {
+    // 2. Gestionamos permisos y obtenemos ubicación con nuestro LocationService
     final status = await Permission.location.request();
     if (status.isDenied || status.isPermanentlyDenied) {
       setState(() {
         _locationDenied = true;
-        _isLoading = false;
-        _myLocation = const LatLng(4.6742, -74.1468);
-        _myPuestoLocation = const LatLng(4.6742, -74.1468);
       });
-      return;
     }
 
     try {
-      final position = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-      );
+      Position position = await _locationService.getCurrentLocation();
+      LatLng currentLatLng = LatLng(position.latitude, position.longitude);
+
       setState(() {
-        _myLocation = LatLng(position.latitude, position.longitude);
-        _myPuestoLocation = LatLng(position.latitude, position.longitude);
+        _myLocation = currentLatLng;
+        _myPuestoLocation = currentLatLng;
+      });
+
+      // 3. Cargamos los vendedores cercanos usando el VendorService
+      List<VendorModel> vendors = await _vendorService.getNearbyVendors(
+        currentLatLng.latitude,
+        currentLatLng.longitude,
+      );
+
+      setState(() {
+        _puestosVecinos = vendors;
         _isLoading = false;
       });
     } catch (e) {
+      // Coordenadas por defecto en caso de error (Bogotá)
+      const fallbackLatLng = LatLng(4.6742, -74.1468);
       setState(() {
-        _myLocation = const LatLng(4.6742, -74.1468);
-        _myPuestoLocation = const LatLng(4.6742, -74.1468);
+        _myLocation = fallbackLatLng;
+        _myPuestoLocation = fallbackLatLng;
         _isLoading = false;
       });
     }
@@ -126,9 +99,9 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     }
   }
 
-  Future<void> _navigateTo(_Puesto puesto) async {
-    final lat = puesto.location.latitude;
-    final lng = puesto.location.longitude;
+  Future<void> _navigateTo(VendorModel puesto) async {
+    final lat = puesto.latitude;
+    final lng = puesto.longitude;
     final uri = Uri.parse(
       'https://www.google.com/maps/dir/?api=1&destination=$lat,$lng&travelmode=walking',
     );
@@ -139,26 +112,30 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final activosCount = _puestosVecinos.where((p) => p.isActive).length;
+
     return Scaffold(
       backgroundColor: const Color(0xFF121420),
       body: SafeArea(
         child: Column(
           children: [
-            _buildHeader(),
+            _buildHeader(activosCount),
             Expanded(
               child: _isLoading
                   ? const Center(
-                      child: CircularProgressIndicator(
-                          color: Color(0xFF00E6A7)))
+                child: CircularProgressIndicator(
+                    color: Color(0xFF00E6A7)),
+              )
                   : Stack(
-                      children: [
-                        _buildMap(),
-                        _buildLegend(),
-                        _buildCenterButton(),
-                        if (_locationDenied) _buildLocationWarning(),
-                        if (_selectedPuesto != null) _buildPuestoCard(),
-                      ],
-                    ),
+                children: [
+                  _buildMap(),
+                  _buildLegend(),
+                  _buildCenterButton(),
+                  if (_locationDenied) _buildLocationWarning(),
+                  if (_selectedVendorPuesto != null || _isMyPuestoSelected)
+                    _buildPuestoCard(),
+                ],
+              ),
             ),
           ],
         ),
@@ -167,8 +144,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   }
 
   // ── HEADER ────────────────────────────────────────────────────────────────
-  Widget _buildHeader() {
-    final activos = _puestosVecinos.where((p) => p.isActive).length;
+  Widget _buildHeader(int activosCount) {
     return Container(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
       color: const Color(0xFF121420),
@@ -187,7 +163,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                 ),
               ),
               Text(
-                'Fontibón • ${_puestosVecinos.length} puestos • $activos activos',
+                'Fontibón • ${_puestosVecinos.length} puestos • $activosCount activos',
                 style: const TextStyle(color: Colors.white54, fontSize: 12),
               ),
             ],
@@ -215,19 +191,22 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     );
   }
 
-  // ── MAPA ──────────────────────────────────────────────────────────────────
+  // ── MAPA (FlutterMap / OpenStreetMap) ─────────────────────────────────────
   Widget _buildMap() {
     return FlutterMap(
       mapController: _mapController,
       options: MapOptions(
         initialCenter: _myLocation ?? const LatLng(4.6742, -74.1468),
         initialZoom: 16.5,
-        onTap: (_, __) => setState(() => _selectedPuesto = null),
+        onTap: (_, __) => setState(() {
+          _selectedVendorPuesto = null;
+          _isMyPuestoSelected = false;
+        }),
       ),
       children: [
         TileLayer(
           urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-          userAgentPackageName: 'com.example.areaguardian',
+          userAgentPackageName: 'com.areaguardian.app',
         ),
         MarkerLayer(
           markers: [
@@ -238,15 +217,10 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                 width: 44,
                 height: 44,
                 child: GestureDetector(
-                  onTap: () => setState(() => _selectedPuesto = _Puesto(
-                        id: 'me',
-                        title: _myPuestoTitle,
-                        vendorName: _myVendorName,
-                        address: _myAddress,
-                        location: _myPuestoLocation!,
-                        isActive: true,
-                        isMe: true,
-                      )),
+                  onTap: () => setState(() {
+                    _isMyPuestoSelected = true;
+                    _selectedVendorPuesto = null;
+                  }),
                   child: _buildMarkerWidget(
                     color: const Color(0xFF00E6A7),
                     icon: Icons.storefront,
@@ -255,14 +229,17 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                 ),
               ),
 
-            // Puestos vecinos
+            // Puestos vecinos (Vendedores de la red)
             ..._puestosVecinos.map(
-              (puesto) => Marker(
-                point: puesto.location,
+                  (puesto) => Marker(
+                point: LatLng(puesto.latitude, puesto.longitude),
                 width: 40,
                 height: 40,
                 child: GestureDetector(
-                  onTap: () => setState(() => _selectedPuesto = puesto),
+                  onTap: () => setState(() {
+                    _selectedVendorPuesto = puesto;
+                    _isMyPuestoSelected = false;
+                  }),
                   child: _buildMarkerWidget(
                     color: puesto.isActive ? Colors.white : Colors.white24,
                     icon: Icons.store_outlined,
@@ -344,8 +321,9 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
 
   // ── BOTÓN CENTRAR ─────────────────────────────────────────────────────────
   Widget _buildCenterButton() {
+    bool cardOpen = (_selectedVendorPuesto != null || _isMyPuestoSelected);
     return Positioned(
-      bottom: _selectedPuesto != null ? 240 : 20,
+      bottom: cardOpen ? 240 : 20,
       right: 12,
       child: GestureDetector(
         onTap: _centerOnMe,
@@ -400,7 +378,14 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
 
   // ── TARJETA DE PUESTO SELECCIONADO ────────────────────────────────────────
   Widget _buildPuestoCard() {
-    final puesto = _selectedPuesto!;
+    final isMe = _isMyPuestoSelected;
+    final puesto = _selectedVendorPuesto;
+
+    String title = isMe ? _myPuestoTitle : (puesto?.shopName ?? 'Puesto Comercial');
+    String subtitle = isMe ? _myVendorName : (puesto?.category ?? '');
+    String address = isMe ? (_myAddress.isNotEmpty ? _myAddress : 'Sin dirección registrada') : 'Nequi: ${puesto?.nequiNumber ?? "N/A"}';
+    bool isActive = isMe ? true : (puesto?.isActive ?? false);
+
     return Positioned(
       bottom: 0,
       left: 0,
@@ -414,7 +399,6 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // Handle
             Container(
               width: 40,
               height: 4,
@@ -424,28 +408,26 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
               ),
             ),
             const SizedBox(height: 16),
-
-            // Info del puesto
             Row(
               children: [
                 Container(
                   width: 56,
                   height: 56,
                   decoration: BoxDecoration(
-                    color: puesto.isMe
+                    color: isMe
                         ? const Color(0xFF00E6A7).withOpacity(0.12)
                         : Colors.white.withOpacity(0.06),
                     borderRadius: BorderRadius.circular(14),
                     border: Border.all(
-                      color: puesto.isMe
+                      color: isMe
                           ? const Color(0xFF00E6A7).withOpacity(0.4)
                           : Colors.white12,
                     ),
                   ),
                   child: Icon(
-                    puesto.isMe ? Icons.storefront : Icons.store_outlined,
+                    isMe ? Icons.storefront : Icons.store_outlined,
                     size: 26,
-                    color: puesto.isMe
+                    color: isMe
                         ? const Color(0xFF00E6A7)
                         : Colors.white54,
                   ),
@@ -459,7 +441,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                         children: [
                           Flexible(
                             child: Text(
-                              puesto.title,
+                              title,
                               style: const TextStyle(
                                 color: Colors.white,
                                 fontWeight: FontWeight.bold,
@@ -468,13 +450,13 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                             ),
                           ),
                           const SizedBox(width: 8),
-                          _buildBadge(puesto),
+                          _buildBadge(isMe, isActive),
                         ],
                       ),
-                      if (puesto.vendorName.isNotEmpty) ...[
+                      if (subtitle.isNotEmpty) ...[
                         const SizedBox(height: 4),
                         Text(
-                          puesto.vendorName,
+                          subtitle,
                           style: const TextStyle(
                               color: Colors.white60, fontSize: 13),
                         ),
@@ -487,9 +469,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                           const SizedBox(width: 4),
                           Expanded(
                             child: Text(
-                              puesto.address.isNotEmpty
-                                  ? puesto.address
-                                  : 'Sin dirección registrada',
+                              address,
                               style: const TextStyle(
                                   color: Colors.white38, fontSize: 12),
                               overflow: TextOverflow.ellipsis,
@@ -504,8 +484,8 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
             ),
             const SizedBox(height: 16),
 
-            // Botones
-            if (!puesto.isMe)
+            // Botones según sea tu puesto o el de un vecino
+            if (!isMe && puesto != null)
               Row(
                 children: [
                   Expanded(
@@ -517,8 +497,10 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                         padding: const EdgeInsets.symmetric(vertical: 12),
                       ),
                       onPressed: () {
-                        _mapController.move(puesto.location, 18);
-                        setState(() => _selectedPuesto = null);
+                        _mapController.move(LatLng(puesto.latitude, puesto.longitude), 18);
+                        setState(() {
+                          _selectedVendorPuesto = null;
+                        });
                       },
                       icon: const Icon(Icons.center_focus_strong,
                           color: Colors.white60, size: 18),
@@ -548,20 +530,20 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                 ],
               ),
 
-            if (puesto.isMe)
+            if (isMe)
               SizedBox(
                 width: double.infinity,
                 child: OutlinedButton.icon(
                   style: OutlinedButton.styleFrom(
                     side: BorderSide(
-                        color:
-                            const Color(0xFF00E6A7).withOpacity(0.4)),
+                        color: const Color(0xFF00E6A7).withOpacity(0.4)),
                     shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(12)),
                     padding: const EdgeInsets.symmetric(vertical: 12),
                   ),
-                  onPressed: () =>
-                      setState(() => _selectedPuesto = null),
+                  onPressed: () => setState(() {
+                    _isMyPuestoSelected = false;
+                  }),
                   icon: const Icon(Icons.check_circle_outline,
                       color: Color(0xFF00E6A7), size: 18),
                   label: const Text('Este es mi puesto',
@@ -576,8 +558,8 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     );
   }
 
-  Widget _buildBadge(_Puesto puesto) {
-    if (puesto.isMe) {
+  Widget _buildBadge(bool isMe, bool isActive) {
+    if (isMe) {
       return Container(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
         decoration: BoxDecoration(
@@ -594,40 +576,19 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
       decoration: BoxDecoration(
-        color: puesto.isActive
+        color: isActive
             ? Colors.green.withOpacity(0.15)
             : Colors.white.withOpacity(0.06),
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
-        puesto.isActive ? 'Activo' : 'Inactivo',
+        isActive ? 'Activo' : 'Inactivo',
         style: TextStyle(
-          color: puesto.isActive ? Colors.greenAccent : Colors.white38,
+          color: isActive ? Colors.greenAccent : Colors.white38,
           fontSize: 10,
           fontWeight: FontWeight.bold,
         ),
       ),
     );
   }
-}
-
-// ── MODELO PUESTO ─────────────────────────────────────────────────────────────
-class _Puesto {
-  final String id;
-  final String title;
-  final String vendorName;
-  final String address;
-  final LatLng location;
-  final bool isActive;
-  final bool isMe;
-
-  const _Puesto({
-    required this.id,
-    required this.title,
-    required this.vendorName,
-    required this.address,
-    required this.location,
-    required this.isActive,
-    this.isMe = false,
-  });
 }

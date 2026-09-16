@@ -3,10 +3,11 @@ import 'package:sensors_plus/sensors_plus.dart';
 import 'dart:async';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
-import 'login.dart';
-import 'map_dashboard.dart';
-import 'account_config.dart';
+import 'package:areaguardian/screens/auth/login.dart';
+import 'package:areaguardian/screens/map_dashboard_screen.dart';
+import 'package:areaguardian/screens/account_config_screen.dart';
 import 'emergency.dart';
+import 'package:vibration/vibration.dart';
 
 // ==========================================
 // PANTALLA PRINCIPAL — HOME
@@ -114,6 +115,9 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   }
 
   void _triggerAlarm() async {
+    if (await Vibration.hasVibrator() ?? false) {
+      Vibration.vibrate(duration: 500); // Vibra durante 500ms
+    }
     setState(() {
       isAlarmActive = true;
       shakeCount = 0;

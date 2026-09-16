@@ -1,6 +1,7 @@
+import 'package:areaguardian/screens/map_dashboard_screen.dart' show MapDashboardScreen;
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'map_dashboard.dart';
+
 
 // ==========================================
 // SECCIÓN DE REGISTRO DE DATOS DEL VENDEDOR

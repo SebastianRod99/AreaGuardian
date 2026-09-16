@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
-import 'home.dart';
-import 'map_dashboard.dart';
-import 'account_config.dart';
-import 'security_screen.dart';
+import 'package:areaguardian/screens//user/home.dart';
+import 'package:areaguardian/screens/map_dashboard_screen.dart';
+import 'package:areaguardian/screens/account_config_screen.dart';
+import 'package:areaguardian/screens/user/security.dart';
 
 // ==========================================
 // NAVEGACIÓN PRINCIPAL CON BOTTOM NAV BAR
