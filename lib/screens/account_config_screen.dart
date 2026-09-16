@@ -2,11 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:areaguardian/screens/auth/login.dart';
-import 'package:areaguardian/screens/auth/pick_location_map.dart'; // <--- CORREGIDO (faltaba el ;)
 import 'package:latlong2/latlong.dart';
+import 'package:areaguardian/screens/auth/pick_location_map.dart';
 
 // ==========================================
-// PANTALLA DE PERFIL / CUENTA (DÚCTIL: CLIENTE / VENDEDOR)
+// PANTALLA DE PERFIL / CUENTA
 // ==========================================
 class AccountConfigScreen extends StatefulWidget {
   const AccountConfigScreen({super.key});
@@ -19,9 +19,13 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
   final _nameController = TextEditingController();
   final _contactController = TextEditingController();
   final _puestoController = TextEditingController();
+  final _addressController = TextEditingController();
+
+  // Coordenadas fijas del puesto guardadas
+  double? _puestoLat;
+  double? _puestoLng;
 
   String _userEmail = '';
-  bool _isVendor = false; // <--- Identificador de rol
   bool _isLoading = false;
   bool _isSaved = false;
 
@@ -34,11 +38,13 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
   Future<void> _loadUserData() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      _nameController.text = prefs.getString('vendor_name') ?? prefs.getString('user_name') ?? '';
+      _nameController.text = prefs.getString('vendor_name') ?? '';
       _contactController.text = prefs.getString('contact') ?? '';
       _puestoController.text = prefs.getString('puesto_title') ?? '';
+      _addressController.text = prefs.getString('vendor_address') ?? '';
+      _puestoLat = prefs.getDouble('puesto_lat');
+      _puestoLng = prefs.getDouble('puesto_lng');
       _userEmail = prefs.getString('user_email') ?? 'usuario@areaguardian.com';
-      _isVendor = prefs.getBool('is_vendor') ?? true;
     });
   }
 
@@ -49,15 +55,16 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     }
     setState(() => _isLoading = true);
     final prefs = await SharedPreferences.getInstance();
-
-    if (_isVendor) {
-      await prefs.setString('vendor_name', _nameController.text.trim());
-      await prefs.setString('puesto_title', _puestoController.text.trim());
-    } else {
-      await prefs.setString('user_name', _nameController.text.trim());
-    }
-
+    await prefs.setString('vendor_name', _nameController.text.trim());
     await prefs.setString('contact', _contactController.text.trim());
+    await prefs.setString('puesto_title', _puestoController.text.trim());
+    await prefs.setString('vendor_address', _addressController.text.trim());
+
+    // Guardamos también las coordenadas si ya fueron seleccionadas en el mapa
+    if (_puestoLat != null && _puestoLng != null) {
+      await prefs.setDouble('puesto_lat', _puestoLat!);
+      await prefs.setDouble('puesto_lng', _puestoLng!);
+    }
 
     setState(() {
       _isLoading = false;
@@ -69,7 +76,30 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
   }
 
   // ==========================================
-  // SELECCIONAR CONTACTO DE LA AGENDA
+  // FUNCIÓN PARA ABRIR EL MAPA Y SELECCIONAR UBICACIÓN
+  // ==========================================
+  Future<void> _openMapPicker() async {
+    final LatLng? selectedPosition = await Navigator.push<LatLng>(
+      context,
+      MaterialPageRoute(builder: (_) => const PickLocationScreen()),
+    );
+
+    if (selectedPosition != null) {
+      setState(() {
+        _puestoLat = selectedPosition.latitude;
+        _puestoLng = selectedPosition.longitude;
+
+        // Opcional: Si quieres poner un texto genérico de dirección basado en las coordenadas si está vacío
+        if (_addressController.text.isEmpty) {
+          _addressController.text = 'Lat: ${_puestoLat!.toStringAsFixed(4)}, Lng: ${_puestoLng!.toStringAsFixed(4)}';
+        }
+      });
+      _showSnack('¡Ubicación del puesto marcada con éxito!');
+    }
+  }
+
+  // ==========================================
+  // FUNCIÓN PARA SELECCIONAR CONTACTO DE LA AGENDA
   // ==========================================
   Future<void> _pickContactFromPhone() async {
     try {
@@ -79,12 +109,18 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
       if (status != PermissionStatus.granted &&
           status != PermissionStatus.limited) {
-        _showSnack('Permiso de contactos denegado', isError: true);
+        _showSnack(
+          'Permiso de contactos denegado',
+          isError: true,
+        );
         return;
       }
 
-      final Contact? contact = await FlutterContacts.native.showPicker(
-        properties: {ContactProperty.phone},
+      final Contact? contact =
+      await FlutterContacts.native.showPicker(
+        properties: {
+          ContactProperty.phone,
+        },
       );
 
       if (contact != null) {
@@ -98,29 +134,17 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
           _showSnack('Contacto seleccionado correctamente');
         } else {
-          _showSnack('El contacto no tiene número registrado', isError: true);
+          _showSnack(
+            'El contacto no tiene número registrado',
+            isError: true,
+          );
         }
       }
     } catch (e) {
-      _showSnack('Error al acceder a los contactos: $e', isError: true);
-    }
-  }
-
-  // ==========================================
-  // NAVEGAR AL MAPA Y CAPTURAR NUEVA UBICACIÓN
-  // ==========================================
-  Future<void> _navigateToChangeLocation() async {
-    final LatLng? selectedLocation = await Navigator.push(
-      context,
-      MaterialPageRoute(builder: (context) => const PickLocationScreen()),
-    );
-
-    if (selectedLocation != null) {
-      final prefs = await SharedPreferences.getInstance();
-      await prefs.setDouble('vendor_latitude', selectedLocation.latitude);
-      await prefs.setDouble('vendor_longitude', selectedLocation.longitude);
-
-      _showSnack('¡Ubicación del puesto actualizada en el mapa!');
+      _showSnack(
+        'Error al acceder a los contactos: $e',
+        isError: true,
+      );
     }
   }
 
@@ -183,6 +207,7 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     _nameController.dispose();
     _contactController.dispose();
     _puestoController.dispose();
+    _addressController.dispose();
     super.dispose();
   }
 
@@ -214,19 +239,21 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
                     const SizedBox(height: 12),
                     _buildContactFieldWithPicker(),
 
-                    if (_isVendor) ...[
-                      const SizedBox(height: 24),
-                      _buildSectionTitle('Información del puesto'),
-                      const SizedBox(height: 12),
-                      _buildField(
-                        controller: _puestoController,
-                        label: 'Nombre del puesto',
-                        icon: Icons.storefront_outlined,
-                        hint: 'Ej: Puesto 3 - Variedades',
-                      ),
-                      const SizedBox(height: 12),
-                      _buildLocationPickerButton(),
-                    ],
+                    const SizedBox(height: 24),
+                    _buildSectionTitle('Información del puesto'),
+                    const SizedBox(height: 12),
+                    _buildField(
+                      controller: _puestoController,
+                      label: 'Nombre del puesto',
+                      icon: Icons.storefront_outlined,
+                      hint: 'Ej: Puesto 3 - Variedades',
+                    ),
+                    const SizedBox(height: 12),
+
+                    // ==========================================
+                    // CAMPO DE DIRECCIÓN VINCULADO AL MAPA
+                    // ==========================================
+                    _buildAddressFieldWithMapPicker(),
 
                     const SizedBox(height: 28),
                     _buildSaveButton(),
@@ -246,6 +273,7 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
+  // ── HEADER ────────────────────────────────────────────────────────────────
   Widget _buildHeader() {
     return Container(
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
@@ -263,26 +291,30 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
             ),
           ),
           const Spacer(),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-            decoration: BoxDecoration(
-              color: (_isVendor ? const Color(0xFF00E6A7) : Colors.blueAccent).withOpacity(0.15),
-              borderRadius: BorderRadius.circular(20),
-            ),
-            child: Text(
-              _isVendor ? 'Puesto / Vendedor' : 'Cliente / Usuario',
-              style: TextStyle(
-                color: _isVendor ? const Color(0xFF00E6A7) : Colors.blueAccent,
-                fontSize: 11,
-                fontWeight: FontWeight.bold,
+          if (_isSaved)
+            Container(
+              padding:
+              const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              decoration: BoxDecoration(
+                color: const Color(0xFF00E6A7).withOpacity(0.15),
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: const Row(
+                children: [
+                  Icon(Icons.check, color: Color(0xFF00E6A7), size: 14),
+                  SizedBox(width: 4),
+                  Text('Guardado',
+                      style: TextStyle(
+                          color: Color(0xFF00E6A7), fontSize: 12)),
+                ],
               ),
             ),
-          ),
         ],
       ),
     );
   }
 
+  // ── AVATAR ────────────────────────────────────────────────────────────────
   Widget _buildAvatar() {
     final initial = _nameController.text.isNotEmpty
         ? _nameController.text[0].toUpperCase()
@@ -447,32 +479,61 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
-  Widget _buildLocationPickerButton() {
+  // ── CAMPO DE DIRECCIÓN CON BOTÓN DE MARCAR EN EL MAPA ────────────────────
+  Widget _buildAddressFieldWithMapPicker() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        const Text(
-          'Ubicación del puesto en el mapa',
-          style: TextStyle(color: Colors.white54, fontSize: 12),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            const Text(
+              'Dirección o sector del puesto',
+              style: TextStyle(color: Colors.white54, fontSize: 12),
+            ),
+            TextButton.icon(
+              onPressed: _openMapPicker,
+              icon: const Icon(Icons.map_outlined, size: 14, color: Color(0xFF00E6A7)),
+              label: const Text(
+                'Marcar en el mapa',
+                style: TextStyle(color: Color(0xFF00E6A7), fontSize: 11),
+              ),
+              style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(0, 0)),
+            ),
+          ],
         ),
         const SizedBox(height: 6),
-        SizedBox(
-          width: double.infinity,
-          height: 48,
-          child: OutlinedButton.icon(
-            style: OutlinedButton.styleFrom(
-              backgroundColor: const Color(0xFF1D2030),
-              side: BorderSide(color: const Color(0xFF00E6A7).withOpacity(0.3)),
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        TextField(
+          controller: _addressController,
+          style: const TextStyle(color: Colors.white, fontSize: 14),
+          onChanged: (_) => setState(() {}),
+          decoration: InputDecoration(
+            hintText: 'Ej: Carrera 96H #17 (Parque Central)',
+            hintStyle: const TextStyle(color: Colors.white24, fontSize: 13),
+            prefixIcon: const Icon(Icons.location_on_outlined, color: Color(0xFF00E6A7), size: 20),
+            suffixIcon: _puestoLat != null
+                ? const Icon(Icons.check_circle, color: Color(0xFF00E6A7), size: 18)
+                : null,
+            filled: true,
+            fillColor: const Color(0xFF1D2030),
+            contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide.none,
             ),
-            onPressed: _navigateToChangeLocation,
-            icon: const Icon(Icons.map_outlined, color: Color(0xFF00E6A7), size: 20),
-            label: const Text(
-              'Actualizar ubicación en el mapa',
-              style: TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w500),
+            focusedBorder: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: const BorderSide(color: Color(0xFF00E6A7), width: 1.5),
             ),
           ),
         ),
+        if (_puestoLat != null && _puestoLng != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            'Coordenadas fijadas: ${_puestoLat!.toStringAsFixed(4)}, ${_puestoLng!.toStringAsFixed(4)}',
+            style: const TextStyle(color: Color(0xFF00E6A7), fontSize: 11),
+          ),
+        ],
       ],
     );
   }
@@ -526,12 +587,10 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
                 color: Color(0xFF00E6A7), size: 18),
           ),
           const SizedBox(width: 12),
-          Expanded(
+          const Expanded(
             child: Text(
-              _isVendor
-                  ? 'Tu perfil está configurado como Vendedor, por lo que participas activamente en la red de apoyo y alertas de la zona.'
-                  : 'Tu perfil está configurado como Cliente. Puedes activar alarmas de emergencia y tu contacto de confianza será notificado.',
-              style: const TextStyle(
+              'Usa "Marcar en el mapa" para fijar la ubicación exacta de tu puesto. Esto permite que otros vendedores y alertas de emergencia te ubiquen correctamente.',
+              style: TextStyle(
                   color: Colors.white54, fontSize: 12, height: 1.4),
             ),
           ),
