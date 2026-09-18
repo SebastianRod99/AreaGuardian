@@ -6,6 +6,10 @@ class EmergencyModel {
   final double longitude;
   final DateTime timestamp;
   final String status; // 'active', 'resolved'
+  // Puestos activos que quedaron dentro del radio al momento de crear la
+  // emergencia (calculado en FirestoreService.createEmergency). Es lo que
+  // lee la Cloud Function para saber a quién notificar.
+  final List<String> notifiedVendorIds;
 
   EmergencyModel({
     required this.id,
@@ -15,6 +19,7 @@ class EmergencyModel {
     required this.longitude,
     required this.timestamp,
     this.status = 'active',
+    this.notifiedVendorIds = const [],
   });
 
   Map<String, dynamic> toJson() {
@@ -26,6 +31,7 @@ class EmergencyModel {
       'longitude': longitude,
       'timestamp': timestamp.toIso8601String(),
       'status': status,
+      'notifiedVendorIds': notifiedVendorIds,
     };
   }
 
@@ -40,6 +46,10 @@ class EmergencyModel {
           ? DateTime.parse(json['timestamp'])
           : DateTime.now(),
       status: json['status'] ?? 'active',
+      notifiedVendorIds: (json['notifiedVendorIds'] as List<dynamic>?)
+          ?.map((e) => e.toString())
+          .toList() ??
+          const [],
     );
   }
 }

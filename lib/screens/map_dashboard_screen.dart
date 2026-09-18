@@ -15,7 +15,16 @@ import '../models/vendor_model.dart';
 // PANTALLA DE MAPA — OpenStreetMap + Firestore
 // ==========================================
 class MapDashboardScreen extends StatefulWidget {
-  const MapDashboardScreen({super.key});
+  /// Si vienen de una notificación de emergencia (HU-05), el mapa se centra
+  /// aquí y se pinta un marcador de alerta en ese punto.
+  final double? focusLatitude;
+  final double? focusLongitude;
+
+  const MapDashboardScreen({
+    super.key,
+    this.focusLatitude,
+    this.focusLongitude,
+  });
 
   @override
   State<MapDashboardScreen> createState() => _MapDashboardScreenState();
@@ -26,10 +35,15 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   final LocationService _locationService = LocationService();
   final FirestoreService _firestoreService = FirestoreService();
 
+  // Ubicación EN VIVO del usuario actual (dueño o cliente) — centra el mapa
+  // y, si el rol es cliente, es también su propio marcador (HU-06).
   LatLng? _myLocation;
+  // Ubicación FIJA de mi puesto — solo aplica a vendedores.
   LatLng? _myPuestoLocation;
+
   bool _isLoading = true;
   bool _locationDenied = false;
+  bool _isVendorRole = false;
 
   String _myPuestoTitle = 'Mi Puesto';
   String _myVendorName = '';
@@ -47,9 +61,10 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   }
 
   Future<void> _loadMyPuestoAndLocation() async {
-    // 1. Cargamos datos locales del puesto del usuario
+    // 1. Cargamos datos locales del usuario (rol + datos del puesto si aplica)
     final prefs = await SharedPreferences.getInstance();
     setState(() {
+      _isVendorRole = (prefs.getString('user_role') ?? '') == 'vendor';
       _myPuestoTitle = prefs.getString('puesto_title') ?? 'Mi Puesto';
       _myVendorName = prefs.getString('vendor_name') ?? '';
       _myAddress = prefs.getString('vendor_address') ?? '';
@@ -67,9 +82,21 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       Position position = await _locationService.getCurrentLocation();
       LatLng currentLatLng = LatLng(position.latitude, position.longitude);
 
+      // Ubicación FIJA del puesto — solo tiene sentido para vendedores.
+      // Un cliente nunca marcó 'vendor_latitude/longitude', así que su
+      // marcador de "puesto" simplemente no se pinta (ver _buildMap).
+      LatLng? fixedPuestoLatLng;
+      if (_isVendorRole) {
+        final double? fixedLat = prefs.getDouble('vendor_latitude');
+        final double? fixedLng = prefs.getDouble('vendor_longitude');
+        fixedPuestoLatLng = (fixedLat != null && fixedLng != null)
+            ? LatLng(fixedLat, fixedLng)
+            : currentLatLng; // fallback solo si nunca marcó su puesto
+      }
+
       setState(() {
+        _myPuestoLocation = fixedPuestoLatLng;
         _myLocation = currentLatLng;
-        _myPuestoLocation = currentLatLng;
       });
 
       // 3. Consultamos los puestos reales directamente desde Firestore
@@ -79,12 +106,23 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
         _puestosVecinos = vendors;
         _isLoading = false;
       });
+
+      // HU-05: si llegamos desde una notificación de emergencia, centramos
+      // el mapa ahí en cuanto el widget termine de construirse.
+      if (widget.focusLatitude != null && widget.focusLongitude != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _mapController.move(
+            LatLng(widget.focusLatitude!, widget.focusLongitude!),
+            18,
+          );
+        });
+      }
     } catch (e) {
       // Coordenadas por defecto en caso de error (Bogotá)
       const fallbackLatLng = LatLng(4.6742, -74.1468);
       setState(() {
         _myLocation = fallbackLatLng;
-        _myPuestoLocation = fallbackLatLng;
+        _myPuestoLocation = _isVendorRole ? fallbackLatLng : null;
         _isLoading = false;
       });
     }
@@ -94,6 +132,13 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     if (_myLocation != null) {
       _mapController.move(_myLocation!, 17);
     }
+  }
+
+  void _selectVecino(VendorModel puesto) {
+    setState(() {
+      _selectedVendorPuesto = puesto;
+      _isMyPuestoSelected = false;
+    });
   }
 
   Future<void> _navigateTo(VendorModel puesto) async {
@@ -110,6 +155,8 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   @override
   Widget build(BuildContext context) {
     final activosCount = _puestosVecinos.where((p) => p.isActive).length;
+    final bool showingEmergency =
+        widget.focusLatitude != null && widget.focusLongitude != null;
 
     return Scaffold(
       backgroundColor: const Color(0xFF121420),
@@ -128,7 +175,9 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                   _buildMap(),
                   _buildLegend(),
                   _buildCenterButton(),
-                  if (_locationDenied) _buildLocationWarning(),
+                  if (showingEmergency) _buildEmergencyBanner(),
+                  if (_locationDenied && !showingEmergency)
+                    _buildLocationWarning(),
                   if (_selectedVendorPuesto != null || _isMyPuestoSelected)
                     _buildPuestoCard(),
                 ],
@@ -207,8 +256,9 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
         ),
         MarkerLayer(
           markers: [
-            // Mi puesto
-            if (_myPuestoLocation != null)
+            // Mi puesto — ubicación FIJA (pick_location_map), ícono tienda.
+            // Solo aplica al rol vendedor.
+            if (_isVendorRole && _myPuestoLocation != null)
               Marker(
                 point: _myPuestoLocation!,
                 width: 44,
@@ -226,24 +276,72 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                 ),
               ),
 
-            // Puestos de la red (Firestore)
-            ..._puestosVecinos.map(
-                  (puesto) => Marker(
+            // Yo — ubicación EN VIVO, ícono persona. Solo aplica al rol
+            // cliente (HU-06): confirma que su ubicación se está compartiendo
+            // mientras la guardia está activa.
+            if (!_isVendorRole && _myLocation != null)
+              Marker(
+                point: _myLocation!,
+                width: 40,
+                height: 40,
+                child: GestureDetector(
+                  onTap: () => ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'Esta es tu ubicación en tiempo real, compartida mientras la guardia está activa.',
+                      ),
+                      backgroundColor: Color(0xFF1D2030),
+                    ),
+                  ),
+                  child: _buildMarkerWidget(
+                    color: const Color(0xFF00E6A7),
+                    icon: Icons.person,
+                    isMe: true,
+                  ),
+                ),
+              ),
+
+            // Marcador de la EMERGENCIA (HU-05) — solo si llegamos aquí
+            // desde una notificación push.
+            if (widget.focusLatitude != null && widget.focusLongitude != null)
+              Marker(
+                point: LatLng(widget.focusLatitude!, widget.focusLongitude!),
+                width: 46,
+                height: 46,
+                child: _buildMarkerWidget(
+                  color: Colors.red,
+                  icon: Icons.warning_amber_rounded,
+                ),
+              ),
+
+            // Puestos de la red (Firestore): un marcador de PUESTO (fijo,
+            // tienda) y uno de DUEÑO (en vivo, persona) por cada vecino.
+            ..._puestosVecinos.expand((puesto) => [
+              Marker(
                 point: LatLng(puesto.latitude, puesto.longitude),
                 width: 40,
                 height: 40,
                 child: GestureDetector(
-                  onTap: () => setState(() {
-                    _selectedVendorPuesto = puesto;
-                    _isMyPuestoSelected = false;
-                  }),
+                  onTap: () => _selectVecino(puesto),
                   child: _buildMarkerWidget(
-                    color: puesto.isActive ? Colors.white : Colors.white24,
                     icon: Icons.store_outlined,
+                    color: puesto.isActive ? Colors.white : Colors.white24,
                   ),
                 ),
               ),
-            ),
+              Marker(
+                point: LatLng(puesto.currentLatitude, puesto.currentLongitude),
+                width: 36,
+                height: 36,
+                child: GestureDetector(
+                  onTap: () => _selectVecino(puesto),
+                  child: _buildMarkerWidget(
+                    icon: Icons.person,
+                    color: puesto.isActive ? Colors.white : Colors.white24,
+                  ),
+                ),
+              ),
+            ]),
           ],
         ),
       ],
@@ -290,7 +388,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _legendItem(const Color(0xFF00E6A7), 'Mi puesto'),
+            _legendItem(const Color(0xFF00E6A7), _isVendorRole ? 'Mi puesto' : 'Yo'),
             const SizedBox(height: 4),
             _legendItem(Colors.white, 'Activo'),
             const SizedBox(height: 4),
@@ -365,6 +463,38 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
               child: Text(
                 'Ubicación no disponible — mostrando Fontibón',
                 style: TextStyle(color: Colors.white, fontSize: 11),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── AVISO DE EMERGENCIA (HU-05) ───────────────────────────────────────────
+  Widget _buildEmergencyBanner() {
+    return Positioned(
+      top: 12,
+      left: 12,
+      right: 70,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: Colors.red.withOpacity(0.92),
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: const Row(
+          children: [
+            Icon(Icons.warning_amber_rounded, color: Colors.white, size: 16),
+            SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                '🚨 Emergencia cerca — ve al punto marcado en rojo',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 11,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ),
           ],

@@ -1,9 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart'; // 1. Importa Firebase Core
+import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'widgets/bar_nav.dart';
 import 'screens/auth/login.dart';
 import 'screens/auth/register.dart';
+import 'services/notification_service.dart';
 
 void main() async { // 2. Se convierte en async
   // 3. Obligatorio para asegurar la vinculación de widgets antes de inicializar servicios nativos
@@ -11,6 +13,11 @@ void main() async { // 2. Se convierte en async
 
   // 4. Inicializa la conexión con Firebase
   await Firebase.initializeApp();
+
+  // 5. Registra el handler de notificaciones FCM en segundo plano.
+  // Debe llamarse antes de runApp() y apuntar a una función de nivel
+  // superior (definida en notification_service.dart).
+  FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
 
   runApp(const AreaGuardianApp());
 }
@@ -21,6 +28,9 @@ class AreaGuardianApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      // Permite navegar (ej. al mapa) desde NotificationService, fuera del
+      // árbol de widgets, cuando el usuario toca una notificación.
+      navigatorKey: navigatorKey,
       title: 'AreaGuardian',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(

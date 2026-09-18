@@ -1,3 +1,5 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+
 class VendorModel {
   final String id;
   final String userId;
@@ -17,6 +19,9 @@ class VendorModel {
   final String daviplataNumber;
   final bool isActive;
   final DateTime? lastSeen;
+  // Token de notificaciones push (Sprint 2). Nulo hasta que el dispositivo
+  // se registra en NotificationService — no todos los documentos lo tienen.
+  final String? fcmToken;
 
   VendorModel({
     required this.id,
@@ -32,6 +37,7 @@ class VendorModel {
     required this.daviplataNumber,
     this.isActive = true,
     this.lastSeen,
+    this.fcmToken,
   });
 
   Map<String, dynamic> toJson() {
@@ -49,6 +55,7 @@ class VendorModel {
       'daviplataNumber': daviplataNumber,
       'isActive': isActive,
       'lastSeen': lastSeen?.toIso8601String(),
+      if (fcmToken != null) 'fcmToken': fcmToken,
     };
   }
 
@@ -66,9 +73,23 @@ class VendorModel {
       nequiNumber: json['nequiNumber'] ?? '',
       daviplataNumber: json['daviplataNumber'] ?? '',
       isActive: json['isActive'] ?? true,
-      lastSeen: json['lastSeen'] != null ? DateTime.tryParse(json['lastSeen']) : null,
+      lastSeen: _parseLastSeen(json['lastSeen']),
+      fcmToken: json['fcmToken'] as String?,
     );
   }
+
+  /// 'lastSeen' puede venir como String ISO8601 (saveVendorProfile,
+  /// updateCurrentLocation) o como Timestamp de Firestore
+  /// (updateVendorLiveLocation usa FieldValue.serverTimestamp()). Aceptamos
+  /// ambos para no romper el parseo según cuál haya escrito el campo por
+  /// última vez.
+  static DateTime? _parseLastSeen(dynamic value) {
+    if (value == null) return null;
+    if (value is Timestamp) return value.toDate();
+    if (value is String) return DateTime.tryParse(value);
+    return null;
+  }
+
   VendorModel copyWith({
     String? shopName,
     String? vendorName,
@@ -78,6 +99,7 @@ class VendorModel {
     double? currentLongitude,
     bool? isActive,
     DateTime? lastSeen,
+    String? fcmToken,
   }) {
     return VendorModel(
       id: id,
@@ -93,6 +115,7 @@ class VendorModel {
       daviplataNumber: daviplataNumber,
       isActive: isActive ?? this.isActive,
       lastSeen: lastSeen ?? this.lastSeen,
+      fcmToken: fcmToken ?? this.fcmToken,
     );
   }
 }

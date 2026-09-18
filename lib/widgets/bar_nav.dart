@@ -1,8 +1,14 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:areaguardian/screens//user/home.dart';
 import 'package:areaguardian/screens/map_dashboard_screen.dart';
 import 'package:areaguardian/screens/account_config_screen.dart';
 import 'package:areaguardian/screens/user/security.dart';
+import 'package:areaguardian/services/notification_service.dart';
+import 'package:areaguardian/services/firestore_service.dart';
+import 'package:areaguardian/services/location_service.dart';
 
 // ==========================================
 // NAVEGACIÓN PRINCIPAL CON BOTTOM NAV BAR
@@ -18,6 +24,14 @@ class AppShell extends StatefulWidget {
 class _AppShellState extends State<AppShell> {
   late int _currentIndex;
 
+  final FirestoreService _firestoreService = FirestoreService();
+  final LocationService _locationService = LocationService();
+
+  // Umbral de proximidad dueño↔puesto (mismo valor que usaba vendor_home.dart).
+  static const double _proximityThresholdMeters = 40.0;
+  static const Duration _proximityCheckInterval = Duration(seconds: 15);
+  Timer? _vendorProximityTimer;
+
   // Pantallas del nav bar — en orden
   final List<Widget> _screens = const [
     MainScreen(),        // 0 — Inicio / Seguridad
@@ -30,11 +44,71 @@ class _AppShellState extends State<AppShell> {
   void initState() {
     super.initState();
     _currentIndex = widget.initialIndex;
+    _initializeSessionServices();
+  }
+
+  /// Arranca, una sola vez por sesión, los servicios que deben vivir
+  /// mientras el usuario está logueado — sin importar en qué pestaña esté:
+  /// - Notificaciones push (todos los roles, aunque solo el vendedor recibe
+  ///   alertas de emergencia por ahora).
+  /// - Chequeo de proximidad dueño↔puesto (solo vendedores). Esto reemplaza
+  ///   la lógica que tenía vendor_home.dart, una pantalla a la que nunca se
+  ///   navegaba y por lo tanto nunca corría.
+  Future<void> _initializeSessionServices() async {
+    await NotificationService().initialize();
+
+    final prefs = await SharedPreferences.getInstance();
+    final String role = prefs.getString('user_role') ?? '';
+    if (role == 'vendor') {
+      _startVendorProximityTracking(prefs);
+    }
+  }
+
+  void _startVendorProximityTracking(SharedPreferences prefs) {
+    _checkVendorProximityOnce(prefs); // primera medición inmediata
+    _vendorProximityTimer?.cancel();
+    _vendorProximityTimer = Timer.periodic(_proximityCheckInterval, (_) {
+      _checkVendorProximityOnce(prefs);
+    });
+  }
+
+  Future<void> _checkVendorProximityOnce(SharedPreferences prefs) async {
+    final String vendorId = prefs.getString('vendor_id') ?? '';
+    final double? shopLat = prefs.getDouble('vendor_latitude');
+    final double? shopLng = prefs.getDouble('vendor_longitude');
+
+    if (vendorId.isEmpty || shopLat == null || shopLng == null) return;
+
+    try {
+      final position = await _locationService.getCurrentLocation();
+      final double distance = Geolocator.distanceBetween(
+        shopLat,
+        shopLng,
+        position.latitude,
+        position.longitude,
+      );
+      final bool isAtShop = distance <= _proximityThresholdMeters;
+
+      await _firestoreService.updateVendorLiveLocation(
+        vendorId: vendorId,
+        currentLatitude: position.latitude,
+        currentLongitude: position.longitude,
+        isActive: isAtShop,
+      );
+    } catch (e) {
+      debugPrint('Error verificando proximidad del vendedor: $e');
+    }
   }
 
   void _onTabTapped(int index) {
     if (index == _currentIndex) return;
     setState(() => _currentIndex = index);
+  }
+
+  @override
+  void dispose() {
+    _vendorProximityTimer?.cancel();
+    super.dispose();
   }
 
   @override
