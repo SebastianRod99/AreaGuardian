@@ -1,13 +1,19 @@
 import 'package:flutter/material.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+
 import 'dart:async';
+
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:areaguardian/screens/auth/login.dart';
 import 'package:areaguardian/screens/map_dashboard_screen.dart';
 import 'package:areaguardian/screens/account_config_screen.dart';
+
 import 'emergency.dart';
+
 import 'package:vibration/vibration.dart';
+import 'package:areaguardian/services/firestore_service.dart';
+import 'package:areaguardian/services/location_service.dart';
 
 // ==========================================
 // PANTALLA PRINCIPAL — HOME
@@ -31,6 +37,21 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   String emergencyContact = 'Sin contacto de emergencia';
   int shakeCount = 0;
   DateTime? lastShakeTime;
+  DateTime? _lastAlertTime;
+  String? _activeEmergencyId;
+
+  // Estado del puesto del vendedor y su proximidad al punto fijo.
+  final LocationService _locationService = LocationService();
+  final FirestoreService _firestoreService = FirestoreService();
+  Timer? _vendorProximityTimer;
+  String _vendorId = '';
+  double? _vendorLatitude;
+  double? _vendorLongitude;
+  double _vendorDistanceMeters = 0;
+  bool _isVendor = false;
+  bool _isVendorActive = false;
+  bool _isNearVendorPost = false;
+  bool _showVendorActivationPrompt = false;
 
   // ── Sensores y audio ──────────────────────────────────────────────────────
   StreamSubscription? _accelerometerSubscription;
@@ -70,12 +91,78 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
 
   Future<void> _loadPreferences() async {
     final prefs = await SharedPreferences.getInstance();
+    final vendorId = prefs.getString('vendor_id') ?? '';
+    final isVendor = (prefs.getString('user_role') ?? '') == 'vendor';
     setState(() {
       _isLoggedIn = prefs.getBool('is_logged_in') ?? false;
       _userName = prefs.getString('vendor_name') ?? '';
       _userEmail = prefs.getString('user_email') ?? '';
-      emergencyContact = prefs.getString('contact') ?? 'Sin contacto de emergencia';
+      emergencyContact =
+          prefs.getString('contact') ?? 'Sin contacto de emergencia';
+      _vendorId = vendorId;
+      _isVendor = isVendor;
+      _vendorLatitude = prefs.getDouble('vendor_latitude');
+      _vendorLongitude = prefs.getDouble('vendor_longitude');
     });
+
+    if (!isVendor || vendorId.isEmpty) return;
+    final vendor = await _firestoreService.getVendor(vendorId);
+    if (!mounted) return;
+    setState(() => _isVendorActive = vendor?.isActive ?? false);
+    await _checkVendorProximity();
+    _vendorProximityTimer = Timer.periodic(
+      const Duration(seconds: 15),
+      (_) => _checkVendorProximity(),
+    );
+  }
+
+  Future<void> _checkVendorProximity() async {
+    if (!_isVendor ||
+        _vendorId.isEmpty ||
+        _vendorLatitude == null ||
+        _vendorLongitude == null) {
+      return;
+    }
+
+    final position = await _locationService.getCurrentLocationOrNull();
+    if (position == null || !mounted) return;
+
+    final distance = _locationService.distanceBetween(
+      position,
+      _vendorLatitude!,
+      _vendorLongitude!,
+    );
+    final isNear = distance <= LocationService.vendorProximityRadiusMeters;
+    setState(() {
+      _vendorDistanceMeters = distance;
+      _isNearVendorPost = isNear;
+      _showVendorActivationPrompt = isNear && !_isVendorActive;
+    });
+  }
+
+  Future<void> _activateVendor() async {
+    if (!_isNearVendorPost || _vendorId.isEmpty) return;
+    try {
+      await _firestoreService.setVendorActive(
+        vendorId: _vendorId,
+        isActive: true,
+      );
+      if (!mounted) return;
+      setState(() {
+        _isVendorActive = true;
+        _showVendorActivationPrompt = false;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Tu puesto ahora está activo para la comunidad.'),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('No se pudo activar el puesto: $e')),
+      );
+    }
   }
 
   // ── Guardia ───────────────────────────────────────────────────────────────
@@ -94,13 +181,21 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     });
     _accelerometerSubscription = accelerometerEvents.listen((event) {
       if (!isProtected || isAlarmActive) return;
-      double gForce = (event.x * event.x + event.y * event.y + event.z * event.z) / (9.8 * 9.8);
+      double gForce =
+          (event.x * event.x + event.y * event.y + event.z * event.z) /
+          (9.8 * 9.8);
       if (gForce > 3.0) {
         final now = DateTime.now();
-        if (lastShakeTime == null || now.difference(lastShakeTime!) > const Duration(milliseconds: 500)) {
+        if (_lastAlertTime != null &&
+            now.difference(_lastAlertTime!) < const Duration(seconds: 5)) {
+          return;
+        }
+        if (lastShakeTime == null ||
+            now.difference(lastShakeTime!) >
+                const Duration(milliseconds: 500)) {
           lastShakeTime = now;
           setState(() => shakeCount++);
-          if (shakeCount >= 3) _triggerAlarm();
+          if (shakeCount >= 4) _triggerAlarm();
         }
       }
     });
@@ -115,8 +210,36 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   }
 
   void _triggerAlarm() async {
+    final prefs = await SharedPreferences.getInstance();
+    final position = await LocationService().getCurrentLocationForEmergency();
+    if (position == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No se pudo obtener tu ubicación exacta.'),
+          ),
+        );
+      }
+      return;
+    }
+
+    final userId =
+        prefs.getString('user_id') ?? prefs.getString('client_id') ?? '';
+    final userName =
+        prefs.getString('user_name') ??
+        prefs.getString('vendor_name') ??
+        'Usuario AreaGuardian';
+    final emergency = await FirestoreService().createEmergency(
+      userId: userId,
+      userName: userName,
+      latitude: position.latitude,
+      longitude: position.longitude,
+    );
+    _activeEmergencyId = emergency.id;
+    _lastAlertTime = DateTime.now();
+
     if (await Vibration.hasVibrator() ?? false) {
-      Vibration.vibrate(duration: 500); // Vibra durante 500ms
+      await Vibration.vibrate(pattern: [0, 100, 100, 100, 100, 100]);
     }
     setState(() {
       isAlarmActive = true;
@@ -129,6 +252,10 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
 
   void _cancelAlarm() async {
     await _audioPlayer.stop();
+    if (_activeEmergencyId != null) {
+      await FirestoreService().resolveEmergency(_activeEmergencyId!);
+      _activeEmergencyId = null;
+    }
     setState(() {
       isAlarmActive = false;
       shakeCount = 0;
@@ -148,6 +275,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   @override
   void dispose() {
     _accelerometerSubscription?.cancel();
+    _vendorProximityTimer?.cancel();
     _audioPlayer.dispose();
     _pulseController.dispose();
     super.dispose();
@@ -168,6 +296,10 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               _buildHeader(),
+              if (_isVendor) ...[
+                _buildVendorActivationCard(),
+                const SizedBox(height: 16),
+              ],
               const SizedBox(height: 24),
               _buildSecurityCard(),
               const SizedBox(height: 16),
@@ -183,6 +315,64 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   }
 
   // ── HEADER ────────────────────────────────────────────────────────────────
+  Widget _buildVendorActivationCard() {
+    final statusColor = _isVendorActive
+        ? const Color(0xFF00E6A7)
+        : (_isNearVendorPost ? Colors.orangeAccent : Colors.white54);
+    final statusText = _isVendorActive
+        ? 'Puesto activo para la comunidad'
+        : _isNearVendorPost
+        ? '¿Estás en tu puesto? ¿Deseas activarlo?'
+        : 'A ${_vendorDistanceMeters.toStringAsFixed(0)} m de tu puesto';
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1D2030),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: statusColor.withOpacity(0.7)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(
+                _isVendorActive ? Icons.storefront : Icons.location_on,
+                color: statusColor,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  statusText,
+                  style: TextStyle(
+                    color: statusColor,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          if (_showVendorActivationPrompt) ...[
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: _activateVendor,
+                icon: const Icon(Icons.power_settings_new),
+                label: const Text('Activar mi puesto'),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF00E6A7),
+                  foregroundColor: Colors.black,
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
   Widget _buildHeader() {
     return Row(
       mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -240,7 +430,10 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                     if (_userEmail.isNotEmpty)
                       Text(
                         _userEmail,
-                        style: const TextStyle(color: Colors.white38, fontSize: 10),
+                        style: const TextStyle(
+                          color: Colors.white38,
+                          fontSize: 10,
+                        ),
                       ),
                   ],
                 ),
@@ -303,7 +496,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           const SizedBox(height: 4),
           Text(
             isProtected
-                ? 'Agita 3 veces para activar la alarma'
+                ? 'Agita 4 veces para activar la alarma'
                 : 'Activa la guardia para comenzar',
             style: const TextStyle(color: Colors.white54, fontSize: 12),
           ),
@@ -311,17 +504,20 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
           if (isProtected)
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
-              children: List.generate(3, (i) => Container(
-                margin: const EdgeInsets.symmetric(horizontal: 5),
-                width: 12,
-                height: 12,
-                decoration: BoxDecoration(
-                  shape: BoxShape.circle,
-                  color: i < shakeCount
-                      ? const Color(0xFF00E6A7)
-                      : Colors.white12,
+              children: List.generate(
+                4,
+                (i) => Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 5),
+                  width: 12,
+                  height: 12,
+                  decoration: BoxDecoration(
+                    shape: BoxShape.circle,
+                    color: i < shakeCount
+                        ? const Color(0xFF00E6A7)
+                        : Colors.white12,
+                  ),
                 ),
-              )),
+              ),
             ),
           if (isProtected) const SizedBox(height: 14),
           SizedBox(
@@ -353,6 +549,24 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
             ),
           ),
           const SizedBox(height: 12),
+          if (isProtected && !isAlarmActive)
+            SizedBox(
+              width: double.infinity,
+              height: 46,
+              child: OutlinedButton.icon(
+                onPressed: _triggerAlarm,
+                icon: const Icon(Icons.warning_amber_rounded),
+                label: const Text('ACTIVAR EMERGENCIA AHORA'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.redAccent,
+                  side: const BorderSide(color: Colors.redAccent),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                ),
+              ),
+            ),
+          if (isProtected && !isAlarmActive) const SizedBox(height: 12),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             decoration: BoxDecoration(
@@ -365,7 +579,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                 SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    '① Activa la guardia  ② Guarda el celular  ③ Agita 3 veces fuerte',
+                    '① Activa la guardia  ② Guarda el celular  ③ Agita 4 veces fuerte',
                     style: TextStyle(color: Colors.white38, fontSize: 11),
                   ),
                 ),
@@ -418,7 +632,10 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                     if (_userEmail.isNotEmpty)
                       Text(
                         _userEmail,
-                        style: const TextStyle(color: Colors.white38, fontSize: 12),
+                        style: const TextStyle(
+                          color: Colors.white38,
+                          fontSize: 12,
+                        ),
                       ),
                   ],
                 ),
@@ -441,7 +658,9 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                   label: 'Ver Mapa',
                   onTap: () => Navigator.push(
                     context,
-                    MaterialPageRoute(builder: (_) => const MapDashboardScreen()),
+                    MaterialPageRoute(
+                      builder: (_) => const MapDashboardScreen(),
+                    ),
                   ),
                 ),
               ),
@@ -453,7 +672,9 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                   onTap: () async {
                     await Navigator.push(
                       context,
-                      MaterialPageRoute(builder: (_) => const AccountConfigScreen()),
+                      MaterialPageRoute(
+                        builder: (_) => const AccountConfigScreen(),
+                      ),
                     );
                     _loadPreferences();
                   },
@@ -646,7 +867,11 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               );
               _loadPreferences();
             },
-            child: const Icon(Icons.chevron_right, color: Colors.white24, size: 20),
+            child: const Icon(
+              Icons.chevron_right,
+              color: Colors.white24,
+              size: 20,
+            ),
           ),
         ],
       ),
@@ -687,7 +912,10 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                   SizedBox(width: 8),
                   Text(
                     'AreaGuardian',
-                    style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white),
+                    style: TextStyle(
+                      fontWeight: FontWeight.bold,
+                      color: Colors.white,
+                    ),
                   ),
                 ],
               ),
@@ -701,7 +929,11 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                   border: Border.all(color: Colors.red, width: 2.5),
                 ),
                 child: const Center(
-                  child: Icon(Icons.warning_amber_rounded, size: 70, color: Colors.red),
+                  child: Icon(
+                    Icons.warning_amber_rounded,
+                    size: 70,
+                    color: Colors.red,
+                  ),
                 ),
               ),
               const SizedBox(height: 20),
@@ -721,14 +953,21 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               ),
               const Spacer(),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
+                ),
                 decoration: BoxDecoration(
                   color: const Color(0xFF1D2030),
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.person_outline, color: Colors.white54, size: 18),
+                    const Icon(
+                      Icons.person_outline,
+                      color: Colors.white54,
+                      size: 18,
+                    ),
                     const SizedBox(width: 10),
                     Text(
                       emergencyContact,

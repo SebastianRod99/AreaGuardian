@@ -1,4 +1,7 @@
-const {onDocumentCreated} = require("firebase-functions/v2/firestore");
+const {
+  onDocumentCreated,
+  onDocumentWritten,
+} = require("firebase-functions/v2/firestore");
 const {initializeApp} = require("firebase-admin/app");
 const {getFirestore} = require("firebase-admin/firestore");
 const {getMessaging} = require("firebase-admin/messaging");
@@ -7,6 +10,33 @@ initializeApp();
 
 const db = getFirestore();
 const messaging = getMessaging();
+
+/**
+ * Mantiene una proyeccion publica de cada puesto sin copiar datos personales
+ * ni credenciales de pago desde 'vendors'.
+ */
+exports.syncPublicVendor = onDocumentWritten("vendors/{vendorId}", async (event) => {
+  const after = event.data?.after;
+  const publicVendor = db.collection("public_vendors").doc(event.params.vendorId);
+
+  if (!after || !after.exists) {
+    await publicVendor.delete();
+    return;
+  }
+
+  const vendor = after.data();
+  await publicVendor.set({
+    id: event.params.vendorId,
+    shopName: vendor.shopName || "",
+    address: vendor.address || "",
+    latitude: vendor.latitude || 0,
+    longitude: vendor.longitude || 0,
+    isActive: vendor.isActive === true,
+    nequiNumber: vendor.nequiNumber || "",
+    daviplataNumber: vendor.daviplataNumber || "",
+    catalog: Array.isArray(vendor.catalog) ? vendor.catalog : [],
+  });
+});
 
 /**
  * Se dispara cada vez que la app crea un documento en 'emergencies'

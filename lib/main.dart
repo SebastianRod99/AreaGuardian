@@ -1,13 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart'; // 1. Importa Firebase Core
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
 import 'widgets/bar_nav.dart';
 import 'screens/auth/login.dart';
 import 'screens/auth/register.dart';
 import 'services/notification_service.dart';
 
-void main() async { // 2. Se convierte en async
+void main() async {
+  // 2. Se convierte en async
   // 3. Obligatorio para asegurar la vinculación de widgets antes de inicializar servicios nativos
   WidgetsFlutterBinding.ensureInitialized();
 
@@ -63,8 +66,12 @@ class _AuthCheckScreenState extends State<AuthCheckScreen> {
 
   Future<void> _checkSession() async {
     final prefs = await SharedPreferences.getInstance();
+    final firebaseUser = FirebaseAuth.instance.currentUser;
+    if (firebaseUser == null) {
+      await prefs.setBool('is_logged_in', false);
+    }
     setState(() {
-      _isLoggedIn = prefs.getBool('is_logged_in') ?? false;
+      _isLoggedIn = firebaseUser != null;
       _isRegistered = prefs.getBool('is_registered') ?? false;
       _isLoading = false;
     });

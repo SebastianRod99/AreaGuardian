@@ -4,9 +4,11 @@ class UserModel {
   final String email;
   final String phone;
   final bool isVendor;
+  final String? vendorId;
   final double? latitude;
   final double? longitude;
-  final DateTime? lastSeen; // Opcional: útil para saber actividad reciente del usuario
+  final DateTime?
+  lastSeen; // Opcional: útil para saber actividad reciente del usuario
 
   UserModel({
     required this.id,
@@ -14,6 +16,7 @@ class UserModel {
     required this.email,
     required this.phone,
     this.isVendor = false,
+    this.vendorId,
     this.latitude,
     this.longitude,
     this.lastSeen,
@@ -27,6 +30,7 @@ class UserModel {
       'email': email,
       'phone': phone,
       'isVendor': isVendor,
+      if (vendorId != null) 'vendorId': vendorId,
       'latitude': latitude,
       'longitude': longitude,
       'lastSeen': lastSeen?.toIso8601String(),
@@ -41,9 +45,12 @@ class UserModel {
       email: json['email'] ?? '',
       phone: json['phone'] ?? '',
       isVendor: json['isVendor'] ?? false,
+      vendorId: json['vendorId'] as String?,
       latitude: json['latitude']?.toDouble(),
       longitude: json['longitude']?.toDouble(),
-      lastSeen: json['lastSeen'] != null ? DateTime.tryParse(json['lastSeen']) : null,
+      lastSeen: json['lastSeen'] != null
+          ? DateTime.tryParse(json['lastSeen'])
+          : null,
     );
   }
 
@@ -53,6 +60,7 @@ class UserModel {
     String? email,
     String? phone,
     bool? isVendor,
+    String? vendorId,
     double? latitude,
     double? longitude,
     DateTime? lastSeen,
@@ -63,6 +71,7 @@ class UserModel {
       email: email ?? this.email,
       phone: phone ?? this.phone,
       isVendor: isVendor ?? this.isVendor,
+      vendorId: vendorId ?? this.vendorId,
       latitude: latitude ?? this.latitude,
       longitude: longitude ?? this.longitude,
       lastSeen: lastSeen ?? this.lastSeen,

@@ -2,11 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:url_launcher/url_launcher.dart';
+
 import 'dart:async';
 import 'dart:math';
+
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:vibration/vibration.dart';
-
+import 'package:areaguardian/services/firestore_service.dart';
+import 'package:areaguardian/services/location_service.dart';
 
 class EmergencyAlertService {
   static Future<void> sendSMSAlert(BuildContext context) async {
@@ -15,8 +18,11 @@ class EmergencyAlertService {
       String contacto = prefs.getString('contact') ?? '';
 
       if (contacto.isEmpty) {
-        _showSnackBar(context, 'No hay contacto de emergencia guardado',
-            isError: true);
+        _showSnackBar(
+          context,
+          'No hay contacto de emergencia guardado',
+          isError: true,
+        );
         return;
       }
 
@@ -35,8 +41,11 @@ class EmergencyAlertService {
       }
 
       if (numero.isEmpty) {
-        _showSnackBar(context, 'El número de emergencia no es válido',
-            isError: true);
+        _showSnackBar(
+          context,
+          'El número de emergencia no es válido',
+          isError: true,
+        );
         return;
       }
 
@@ -53,7 +62,8 @@ class EmergencyAlertService {
       }
 
       // Mensaje de alerta
-      final String mensaje = '🚨 ALERTA DE EMERGENCIA 🚨\n\n'
+      final String mensaje =
+          '🚨 ALERTA DE EMERGENCIA 🚨\n\n'
           'Necesito ayuda ahora mismo.\n\n'
           '📍 Mi ubicación actual:\n'
           '$ubicacion\n\n'
@@ -75,24 +85,28 @@ class EmergencyAlertService {
         return;
       }
 
-      _showSnackBar(context, 'No se pudo abrir la app de mensajes',
-          isError: true);
+      _showSnackBar(
+        context,
+        'No se pudo abrir la app de mensajes',
+        isError: true,
+      );
     } catch (e) {
       _showSnackBar(context, 'Error al enviar alerta: $e', isError: true);
     }
   }
 
-  static void _showSnackBar(BuildContext context, String message,
-      {bool isError = false}) {
+  static void _showSnackBar(
+    BuildContext context,
+    String message, {
+    bool isError = false,
+  }) {
     if (!context.mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message),
-        backgroundColor:
-            isError ? Colors.redAccent : const Color(0xFF00E6A7),
+        backgroundColor: isError ? Colors.redAccent : const Color(0xFF00E6A7),
         behavior: SnackBarBehavior.floating,
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
         margin: const EdgeInsets.all(16),
       ),
     );
@@ -111,6 +125,7 @@ class _ShakeVibrationScreenState extends State<ShakeVibrationScreen> {
 
   int _shakeCount = 0;
   DateTime? _lastShakeTime;
+  DateTime? _lastAlertTime;
 
   // Umbral de fuerza para considerar que se ha "agitado" el teléfono
   final double _shakeThreshold = 15.0;
@@ -122,22 +137,32 @@ class _ShakeVibrationScreenState extends State<ShakeVibrationScreen> {
   }
 
   void _startListeningSensors() {
-    _accelerometerSubscription = accelerometerEvents.listen((AccelerometerEvent event) {
+    _accelerometerSubscription = accelerometerEvents.listen((
+      AccelerometerEvent event,
+    ) {
       // Calculamos la fuerza total de la aceleración en los 3 ejes (X, Y, Z)
-      double acceleration = sqrt(event.x * event.x + event.y * event.y + event.z * event.z);
+      double acceleration = sqrt(
+        event.x * event.x + event.y * event.y + event.z * event.z,
+      );
 
       // Si la fuerza supera el umbral configurado
       if (acceleration > _shakeThreshold) {
         final now = DateTime.now();
+        if (_lastAlertTime != null &&
+            now.difference(_lastAlertTime!) < const Duration(seconds: 5)) {
+          return;
+        }
 
         // Si es la primera sacudida o ha pasado poco tiempo desde la última (ej. menos de 800ms)
-        if (_lastShakeTime == null || now.difference(_lastShakeTime!) < const Duration(milliseconds: 800)) {
+        if (_lastShakeTime == null ||
+            now.difference(_lastShakeTime!) <
+                const Duration(milliseconds: 800)) {
           _shakeCount++;
           _lastShakeTime = now;
 
-          // Si llega a 3 sacudidas
-          if (_shakeCount >= 3) {
-            _onTripleShakeDetected();
+          // Si llega a 4 sacudidas
+          if (_shakeCount >= 4) {
+            _onFourShakeDetected();
             _shakeCount = 0; // Reiniciamos el contador
             _lastShakeTime = null;
           }
@@ -150,21 +175,33 @@ class _ShakeVibrationScreenState extends State<ShakeVibrationScreen> {
     });
   }
 
-  // ACCIÓN AL COMPLETar LAS 3 SACUDIDAS
-  void _onTripleShakeDetected() async {
-    debugPrint("¡Se detectaron 3 sacudidas!");
+  // ACCIÓN AL COMPLETAR LAS 4 SACUDIDAS
+  void _onFourShakeDetected() async {
+    debugPrint("¡Se detectaron 4 sacudidas!");
 
-    // 1. Hacer vibrar el celular
+    final prefs = await SharedPreferences.getInstance();
+    final position = await LocationService().getCurrentLocationForEmergency();
+    if (position == null) return;
+    await FirestoreService().createEmergency(
+      userId: prefs.getString('user_id') ?? prefs.getString('client_id') ?? '',
+      userName:
+          prefs.getString('user_name') ??
+          prefs.getString('vendor_name') ??
+          'Usuario AreaGuardian',
+      latitude: position.latitude,
+      longitude: position.longitude,
+    );
+    _lastAlertTime = DateTime.now();
+
     if (await Vibration.hasVibrator() ?? false) {
-      // Vibra durante 500 milisegundos (medio segundo)
-      Vibration.vibrate(pattern: [0, 300, 100, 300, 100, 300]);
+      await Vibration.vibrate(pattern: [0, 100, 100, 100, 100, 100]);
     }
 
     // 2. Aquí puedes disparar tu función de alerta (ej: EmergencyAlertService.sendAlert(context))
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(
-        content: Text('🚨 ¡3 sacudidas detectadas! Vibrando y alertando...'),
+        content: Text('🚨 ¡4 sacudidas detectadas! Vibrando y alertando...'),
         backgroundColor: Colors.redAccent,
       ),
     );
@@ -185,7 +222,7 @@ class _ShakeVibrationScreenState extends State<ShakeVibrationScreen> {
         child: Padding(
           padding: EdgeInsets.all(24.0),
           child: Text(
-            'Agita tu celular 3 veces rápidamente para activar la vibración de emergencia.',
+            'Agita tu celular 4 veces rápidamente para activar la vibración de emergencia.',
             textAlign: TextAlign.center,
             style: TextStyle(fontSize: 18),
           ),

@@ -1,16 +1,57 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+
 import '../models/vendor_model.dart';
 import '../models/emergency_model.dart';
+import '../models/user_model.dart';
 
 class FirestoreService {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
 
+  Future<void> saveUserProfile(UserModel user) async {
+    final authenticatedUser = FirebaseAuth.instance.currentUser;
+    if (authenticatedUser == null || authenticatedUser.uid != user.id) {
+      throw StateError('El perfil debe pertenecer al usuario autenticado.');
+    }
+    try {
+      await _db
+          .collection('users')
+          .doc(user.id)
+          .set(user.toJson(), SetOptions(merge: true));
+    } catch (e) {
+      debugPrint('Error al guardar el perfil del usuario: $e');
+      rethrow;
+    }
+  }
+
   /// 1. Guarda o actualiza el perfil completo del vendedor (Puesto Fijo + Estado Inicial)
   Future<void> saveVendorProfile(VendorModel vendor) async {
+    final authenticatedUser = FirebaseAuth.instance.currentUser;
+    if (authenticatedUser == null ||
+        authenticatedUser.uid != vendor.userId ||
+        vendor.id != vendor.userId) {
+      throw ArgumentError(
+        'El puesto debe usar el mismo ID que su propietario.',
+      );
+    }
     try {
-      await _db.collection('vendors').doc(vendor.id).set(vendor.toJson(), SetOptions(merge: true));
+      await _db
+          .collection('vendors')
+          .doc(vendor.id)
+          .set(vendor.toJson(), SetOptions(merge: true));
+      await _db.collection('public_vendors').doc(vendor.id).set({
+        'id': vendor.id,
+        'shopName': vendor.shopName,
+        'address': vendor.address,
+        'latitude': vendor.latitude,
+        'longitude': vendor.longitude,
+        'isActive': vendor.isActive,
+        'nequiNumber': vendor.nequiNumber,
+        'daviplataNumber': vendor.daviplataNumber,
+        'catalog': vendor.catalog,
+      }, SetOptions(merge: true));
     } catch (e) {
       debugPrint('Error al guardar el perfil del vendedor: $e');
       rethrow;
@@ -20,7 +61,7 @@ class FirestoreService {
   /// 2. Obtiene la lista de todos los puestos de la red
   Future<List<VendorModel>> fetchNearbyVendors() async {
     try {
-      QuerySnapshot snapshot = await _db.collection('vendors').get();
+      QuerySnapshot snapshot = await _db.collection('public_vendors').get();
 
       return snapshot.docs.map((doc) {
         final data = doc.data() as Map<String, dynamic>;
@@ -33,58 +74,96 @@ class FirestoreService {
     }
   }
 
-  /// 3. Actualiza únicamente la ubicación en tiempo real del usuario (mientras camina/patrulla)
-  Future<void> updateCurrentLocation(String vendorId, double lat, double lng) async {
-    try {
-      await _db.collection('vendors').doc(vendorId).update({
-        'currentLatitude': lat,
-        'currentLongitude': lng,
-        'lastSeen': DateTime.now().toIso8601String(),
-      });
-    } catch (e) {
-      debugPrint('Error al actualizar ubicación en tiempo real: $e');
-    }
-  }
-
-  /// 4. Control de Actividad ("latido" o confirmación de que sigue abierto/activo)
-  Future<void> updateVendorLiveLocation({
+  Future<void> setVendorActive({
     required String vendorId,
-    required double currentLatitude,
-    required double currentLongitude,
     required bool isActive,
   }) async {
-    try{
-      await _db.collection('vendors').doc(vendorId).update({
-        'currentLatitude': currentLatitude,
-        'currentLongitude': currentLongitude,
-        'isActive': isActive,
-        'lastSeen': FieldValue.serverTimestamp(),
-      });
+    final authenticatedUser = FirebaseAuth.instance.currentUser;
+    if (authenticatedUser == null || authenticatedUser.uid != vendorId) {
+      throw StateError(
+        'Solo el propietario autenticado puede activar el puesto.',
+      );
+    }
+    await _db.collection('vendors').doc(vendorId).update({
+      'isActive': isActive,
+      'lastSeen': FieldValue.serverTimestamp(),
+    });
+    await _db.collection('public_vendors').doc(vendorId).set({
+      'isActive': isActive,
+    }, SetOptions(merge: true));
+  }
+
+  Future<VendorModel?> getVendor(String vendorId) async {
+    final snapshot = await _db.collection('vendors').doc(vendorId).get();
+    if (!snapshot.exists || snapshot.data() == null) return null;
+    final data = snapshot.data()!..['id'] = snapshot.id;
+    return VendorModel.fromJson(data);
+  }
+
+  Future<void> updateVendorFixedLocation({
+    required String vendorId,
+    required double latitude,
+    required double longitude,
+    String? address,
+  }) async {
+    final updates = <String, dynamic>{
+      'latitude': latitude,
+      'longitude': longitude,
+    };
+    if (address != null) updates['address'] = address;
+    await _db.collection('vendors').doc(vendorId).update(updates);
+    await _db
+        .collection('public_vendors')
+        .doc(vendorId)
+        .set(updates, SetOptions(merge: true));
+  }
+
+  Future<void> updateVendorAddress({
+    required String vendorId,
+    required String address,
+  }) async {
+    await _db.collection('vendors').doc(vendorId).update({'address': address});
+    await _db.collection('public_vendors').doc(vendorId).set({
+      'address': address,
+    }, SetOptions(merge: true));
+  }
+
+  Future<List<EmergencyModel>> fetchActiveEmergencies() async {
+    try {
+      final snapshot = await _db
+          .collection('emergencies')
+          .where('status', isEqualTo: 'active')
+          .get();
+      return snapshot.docs.map((doc) {
+        final data = doc.data();
+        data['id'] = data['id'] ?? doc.id;
+        return EmergencyModel.fromJson(data);
+      }).toList();
     } catch (e) {
-      throw Exception('Error al actualizar ubicación en vivo: $e');
+      debugPrint('Error al consultar emergencias activas: $e');
+      return [];
     }
   }
 
-  /// 5. Actualiza la ubicación en tiempo real de un CLIENTE (o dueño usando la
-  /// guardia). Se guarda en una colección aparte de 'vendors' porque un
-  /// cliente no tiene puesto fijo ni categoría — solo identidad + posición.
-  Future<void> updateClientLiveLocation({
-    required String clientId,
-    required String clientName,
-    required double latitude,
-    required double longitude,
-  }) async {
-    try {
-      await _db.collection('clients').doc(clientId).set({
-        'id': clientId,
-        'name': clientName,
-        'latitude': latitude,
-        'longitude': longitude,
-        'lastSeen': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-    } catch (e) {
-      debugPrint('Error al actualizar ubicación en vivo del cliente: $e');
-    }
+  Stream<List<EmergencyModel>> watchActiveEmergencies() {
+    return _db
+        .collection('emergencies')
+        .where('status', isEqualTo: 'active')
+        .snapshots()
+        .map(
+          (snapshot) => snapshot.docs.map((doc) {
+            final data = doc.data();
+            data['id'] = data['id'] ?? doc.id;
+            return EmergencyModel.fromJson(data);
+          }).toList(),
+        );
+  }
+
+  Future<void> resolveEmergency(String emergencyId) async {
+    await _db.collection('emergencies').doc(emergencyId).update({
+      'status': 'resolved',
+      'resolvedAt': FieldValue.serverTimestamp(),
+    });
   }
 
   /// 6. Crea el registro de una emergencia y adjunta los ids de los puestos
@@ -96,6 +175,12 @@ class FirestoreService {
     required double longitude,
     double radiusMeters = 1000,
   }) async {
+    final authenticatedUser = FirebaseAuth.instance.currentUser;
+    if (authenticatedUser == null || authenticatedUser.uid != userId) {
+      throw StateError(
+        'Debes iniciar sesión con Google para crear una alerta.',
+      );
+    }
     final List<String> nearbyVendorIds = await _findActiveVendorIdsNear(
       latitude,
       longitude,
@@ -117,7 +202,9 @@ class FirestoreService {
 
     try {
       await docRef.set(emergency.toJson());
-      debugPrint('Emergencia creada: ${docRef.id} — ${nearbyVendorIds.length} puestos activos en el radio');
+      debugPrint(
+        'Emergencia creada: ${docRef.id} — ${nearbyVendorIds.length} puestos activos en el radio',
+      );
     } catch (e) {
       debugPrint('Error al crear la emergencia en Firestore: $e');
       rethrow;
@@ -126,32 +213,34 @@ class FirestoreService {
     return emergency;
   }
 
-  /// 7. Filtra, entre los puestos activos, los que están dentro del radio
-  /// (en metros) usando la ubicación EN VIVO del dueño (con respaldo a la
-  /// ubicación fija del puesto si aún no hay una lectura en vivo).
+  /// Filtra puestos activos usando exclusivamente su ubicación comercial fija.
   Future<List<String>> _findActiveVendorIdsNear(
-      double lat,
-      double lng,
-      double radiusMeters,
-      ) async {
+    double lat,
+    double lng,
+    double radiusMeters,
+  ) async {
     try {
       final snapshot = await _db
           .collection('vendors')
           .where('isActive', isEqualTo: true)
           .get();
 
-      return snapshot.docs.where((doc) {
-        final data = doc.data();
-        final double vLat = (data['currentLatitude'] as num?)?.toDouble() ??
-            (data['latitude'] as num?)?.toDouble() ??
-            0.0;
-        final double vLng = (data['currentLongitude'] as num?)?.toDouble() ??
-            (data['longitude'] as num?)?.toDouble() ??
-            0.0;
+      return snapshot.docs
+          .where((doc) {
+            final data = doc.data();
+            final double vLat = (data['latitude'] as num?)?.toDouble() ?? 0.0;
+            final double vLng = (data['longitude'] as num?)?.toDouble() ?? 0.0;
 
-        final double distance = Geolocator.distanceBetween(lat, lng, vLat, vLng);
-        return distance <= radiusMeters;
-      }).map((doc) => doc.id).toList();
+            final double distance = Geolocator.distanceBetween(
+              lat,
+              lng,
+              vLat,
+              vLng,
+            );
+            return distance <= radiusMeters;
+          })
+          .map((doc) => doc.id)
+          .toList();
     } catch (e) {
       debugPrint('Error al buscar puestos activos cercanos: $e');
       return [];

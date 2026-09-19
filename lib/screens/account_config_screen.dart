@@ -1,9 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:areaguardian/services/auth_service.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:areaguardian/screens/auth/login.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:areaguardian/screens/auth/pick_location_map.dart';
+import 'package:areaguardian/services/firestore_service.dart';
+import 'package:areaguardian/widgets/bar_nav.dart';
+import 'package:geocoding/geocoding.dart';
 
 // ==========================================
 // PANTALLA DE PERFIL / CUENTA
@@ -28,6 +32,11 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
   String _userEmail = '';
   bool _isLoading = false;
   bool _isSaved = false;
+  bool _isVendorAccount = false;
+  bool _isVendorMode = false;
+  String _vendorId = '';
+  final FirestoreService _firestoreService = FirestoreService();
+  final Geocoding _geocoding = Geocoding();
 
   @override
   void initState() {
@@ -37,15 +46,77 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
   Future<void> _loadUserData() async {
     final prefs = await SharedPreferences.getInstance();
+    final puestoLat =
+        prefs.getDouble('puesto_lat') ?? prefs.getDouble('vendor_latitude');
+    final puestoLng =
+        prefs.getDouble('puesto_lng') ?? prefs.getDouble('vendor_longitude');
+    var address = prefs.getString('vendor_address') ?? '';
+    if (address.isEmpty && puestoLat != null && puestoLng != null) {
+      address = await _addressFromCoordinates(puestoLat, puestoLng);
+      await prefs.setString('vendor_address', address);
+    }
     setState(() {
       _nameController.text = prefs.getString('vendor_name') ?? '';
       _contactController.text = prefs.getString('contact') ?? '';
       _puestoController.text = prefs.getString('puesto_title') ?? '';
-      _addressController.text = prefs.getString('vendor_address') ?? '';
-      _puestoLat = prefs.getDouble('puesto_lat');
-      _puestoLng = prefs.getDouble('puesto_lng');
+      _addressController.text = address;
+      _puestoLat = puestoLat;
+      _puestoLng = puestoLng;
       _userEmail = prefs.getString('user_email') ?? 'usuario@areaguardian.com';
+      _isVendorAccount = prefs.getString('vendor_id')?.isNotEmpty ?? false;
+      _isVendorMode = (prefs.getString('user_role') ?? '') == 'vendor';
+      _vendorId = prefs.getString('vendor_id') ?? '';
     });
+  }
+
+  Future<String> _addressFromCoordinates(
+    double latitude,
+    double longitude,
+  ) async {
+    final fallback =
+        'Lat: ${latitude.toStringAsFixed(6)}, Lng: ${longitude.toStringAsFixed(6)}';
+
+    try {
+      final placemarks = await _geocoding.placemarkFromCoordinates(
+        latitude,
+        longitude,
+      );
+
+      if (placemarks.isEmpty) return fallback;
+
+      final place = placemarks.first;
+
+      final address = [place.street, place.subLocality, place.locality]
+          .whereType<String>()
+          .where((value) => value.trim().isNotEmpty)
+          .join(', ');
+
+      return address.isEmpty ? fallback : address;
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  Future<void> _toggleRoleMode(bool useVendorMode) async {
+    if (_vendorId.isEmpty) return;
+
+    setState(() => _isLoading = true);
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('user_role', useVendorMode ? 'vendor' : 'client');
+    await prefs.setBool('vendor_mode_enabled', useVendorMode);
+    if (!useVendorMode) {
+      await _firestoreService.setVendorActive(
+        vendorId: _vendorId,
+        isActive: false,
+      );
+    }
+
+    if (!mounted) return;
+    Navigator.pushAndRemoveUntil(
+      context,
+      MaterialPageRoute(builder: (_) => const AppShell(initialIndex: 0)),
+      (_) => false,
+    );
   }
 
   Future<void> _saveChanges() async {
@@ -59,11 +130,27 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     await prefs.setString('contact', _contactController.text.trim());
     await prefs.setString('puesto_title', _puestoController.text.trim());
     await prefs.setString('vendor_address', _addressController.text.trim());
+    if (_vendorId.isNotEmpty) {
+      await _firestoreService.updateVendorAddress(
+        vendorId: _vendorId,
+        address: _addressController.text.trim(),
+      );
+    }
 
     // Guardamos también las coordenadas si ya fueron seleccionadas en el mapa
     if (_puestoLat != null && _puestoLng != null) {
+      await prefs.setDouble('vendor_latitude', _puestoLat!);
+      await prefs.setDouble('vendor_longitude', _puestoLng!);
       await prefs.setDouble('puesto_lat', _puestoLat!);
       await prefs.setDouble('puesto_lng', _puestoLng!);
+      if (_vendorId.isNotEmpty) {
+        await _firestoreService.updateVendorFixedLocation(
+          vendorId: _vendorId,
+          latitude: _puestoLat!,
+          longitude: _puestoLng!,
+          address: _addressController.text.trim(),
+        );
+      }
     }
 
     setState(() {
@@ -85,14 +172,15 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
 
     if (selectedPosition != null) {
+      final address = await _addressFromCoordinates(
+        selectedPosition.latitude,
+        selectedPosition.longitude,
+      );
+
       setState(() {
         _puestoLat = selectedPosition.latitude;
         _puestoLng = selectedPosition.longitude;
-
-        // Opcional: Si quieres poner un texto genérico de dirección basado en las coordenadas si está vacío
-        if (_addressController.text.isEmpty) {
-          _addressController.text = 'Lat: ${_puestoLat!.toStringAsFixed(4)}, Lng: ${_puestoLng!.toStringAsFixed(4)}';
-        }
+        _addressController.text = address;
       });
       _showSnack('¡Ubicación del puesto marcada con éxito!');
     }
@@ -109,18 +197,12 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
       if (status != PermissionStatus.granted &&
           status != PermissionStatus.limited) {
-        _showSnack(
-          'Permiso de contactos denegado',
-          isError: true,
-        );
+        _showSnack('Permiso de contactos denegado', isError: true);
         return;
       }
 
-      final Contact? contact =
-      await FlutterContacts.native.showPicker(
-        properties: {
-          ContactProperty.phone,
-        },
+      final Contact? contact = await FlutterContacts.native.showPicker(
+        properties: {ContactProperty.phone},
       );
 
       if (contact != null) {
@@ -134,17 +216,11 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
           _showSnack('Contacto seleccionado correctamente');
         } else {
-          _showSnack(
-            'El contacto no tiene número registrado',
-            isError: true,
-          );
+          _showSnack('El contacto no tiene número registrado', isError: true);
         }
       }
     } catch (e) {
-      _showSnack(
-        'Error al acceder a los contactos: $e',
-        isError: true,
-      );
+      _showSnack('Error al acceder a los contactos: $e', isError: true);
     }
   }
 
@@ -154,8 +230,10 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
       builder: (_) => AlertDialog(
         backgroundColor: const Color(0xFF1D2030),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: const Text('Cerrar sesión',
-            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+        title: const Text(
+          'Cerrar sesión',
+          style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+        ),
         content: const Text(
           '¿Seguro que quieres cerrar sesión?',
           style: TextStyle(color: Colors.white60),
@@ -163,14 +241,20 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancelar',
-                style: TextStyle(color: Colors.white54)),
+            child: const Text(
+              'Cancelar',
+              style: TextStyle(color: Colors.white54),
+            ),
           ),
           TextButton(
             onPressed: () => Navigator.pop(context, true),
-            child: const Text('Cerrar sesión',
-                style: TextStyle(
-                    color: Colors.redAccent, fontWeight: FontWeight.bold)),
+            child: const Text(
+              'Cerrar sesión',
+              style: TextStyle(
+                color: Colors.redAccent,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
           ),
         ],
       ),
@@ -180,12 +264,13 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('is_logged_in', false);
+    await AuthService().signOut();
 
     if (!mounted) return;
     Navigator.pushAndRemoveUntil(
       context,
       MaterialPageRoute(builder: (_) => const LoginScreen()),
-          (route) => false,
+      (route) => false,
     );
   }
 
@@ -193,8 +278,7 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message),
-        backgroundColor:
-        isError ? Colors.redAccent : const Color(0xFF00E6A7),
+        backgroundColor: isError ? Colors.redAccent : const Color(0xFF00E6A7),
         behavior: SnackBarBehavior.floating,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
         margin: const EdgeInsets.all(16),
@@ -222,7 +306,9 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
             Expanded(
               child: SingleChildScrollView(
                 padding: const EdgeInsets.symmetric(
-                    horizontal: 20, vertical: 16),
+                  horizontal: 20,
+                  vertical: 16,
+                ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
@@ -239,6 +325,11 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
                     const SizedBox(height: 12),
                     _buildContactFieldWithPicker(),
 
+                    if (_isVendorAccount) ...[
+                      const SizedBox(height: 24),
+                      _buildRoleModeCard(),
+                    ],
+
                     const SizedBox(height: 24),
                     _buildSectionTitle('Información del puesto'),
                     const SizedBox(height: 12),
@@ -251,9 +342,7 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
                     const SizedBox(height: 12),
 
                     // ==========================================
-                    // CAMPO DE DIRECCIÓN VINCULADO AL MAPA
-                    // ==========================================
-                    _buildAddressFieldWithMapPicker(),
+                    _buildAutomaticAddress(),
 
                     const SizedBox(height: 28),
                     _buildSaveButton(),
@@ -293,8 +382,7 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
           const Spacer(),
           if (_isSaved)
             Container(
-              padding:
-              const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
               decoration: BoxDecoration(
                 color: const Color(0xFF00E6A7).withOpacity(0.15),
                 borderRadius: BorderRadius.circular(20),
@@ -303,9 +391,10 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
                 children: [
                   Icon(Icons.check, color: Color(0xFF00E6A7), size: 14),
                   SizedBox(width: 4),
-                  Text('Guardado',
-                      style: TextStyle(
-                          color: Color(0xFF00E6A7), fontSize: 12)),
+                  Text(
+                    'Guardado',
+                    style: TextStyle(color: Color(0xFF00E6A7), fontSize: 12),
+                  ),
                 ],
               ),
             ),
@@ -390,6 +479,54 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
+  Widget _buildRoleModeCard() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: const Color(0xFF1D2030),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF00E6A7).withOpacity(0.25)),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            _isVendorMode ? Icons.storefront : Icons.person_outline,
+            color: const Color(0xFF00E6A7),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _isVendorMode
+                      ? 'Modo dueño: ${_puestoController.text}'
+                      : 'Modo cliente',
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  _isVendorMode
+                      ? 'Tu puesto puede aparecer activo cuando estés allí.'
+                      : 'Puedes recorrer la red sin activar tu puesto.',
+                  style: const TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
+          Switch(
+            value: _isVendorMode,
+            onChanged: _isLoading ? null : _toggleRoleMode,
+            activeColor: const Color(0xFF00E6A7),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildField({
     required TextEditingController controller,
     required String label,
@@ -415,7 +552,9 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
             filled: true,
             fillColor: const Color(0xFF1D2030),
             contentPadding: const EdgeInsets.symmetric(
-                horizontal: 16, vertical: 14),
+              horizontal: 16,
+              vertical: 14,
+            ),
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(12),
               borderSide: BorderSide.none,
@@ -423,7 +562,9 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
             focusedBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(12),
               borderSide: const BorderSide(
-                  color: Color(0xFF00E6A7), width: 1.5),
+                color: Color(0xFF00E6A7),
+                width: 1.5,
+              ),
             ),
           ),
         ),
@@ -444,12 +585,19 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
             ),
             TextButton.icon(
               onPressed: _pickContactFromPhone,
-              icon: const Icon(Icons.contacts, size: 14, color: Color(0xFF00E6A7)),
+              icon: const Icon(
+                Icons.contacts,
+                size: 14,
+                color: Color(0xFF00E6A7),
+              ),
               label: const Text(
                 'Elegir de la agenda',
                 style: TextStyle(color: Color(0xFF00E6A7), fontSize: 11),
               ),
-              style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(0, 0)),
+              style: TextButton.styleFrom(
+                padding: EdgeInsets.zero,
+                minimumSize: const Size(0, 0),
+              ),
             ),
           ],
         ),
@@ -461,17 +609,27 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
           decoration: InputDecoration(
             hintText: 'Ej: Mamá — 300 123 4567',
             hintStyle: const TextStyle(color: Colors.white24, fontSize: 13),
-            prefixIcon: const Icon(Icons.phone_outlined, color: Color(0xFF00E6A7), size: 20),
+            prefixIcon: const Icon(
+              Icons.phone_outlined,
+              color: Color(0xFF00E6A7),
+              size: 20,
+            ),
             filled: true,
             fillColor: const Color(0xFF1D2030),
-            contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 14,
+            ),
             border: OutlineInputBorder(
               borderRadius: BorderRadius.circular(12),
               borderSide: BorderSide.none,
             ),
             focusedBorder: OutlineInputBorder(
               borderRadius: BorderRadius.circular(12),
-              borderSide: const BorderSide(color: Color(0xFF00E6A7), width: 1.5),
+              borderSide: const BorderSide(
+                color: Color(0xFF00E6A7),
+                width: 1.5,
+              ),
             ),
           ),
         ),
@@ -479,8 +637,8 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
-  // ── CAMPO DE DIRECCIÓN CON BOTÓN DE MARCAR EN EL MAPA ────────────────────
-  Widget _buildAddressFieldWithMapPicker() {
+  // ── UBICACIÓN AUTOMÁTICA Y BOTÓN PARA CAMBIAR EL PIN ─────────────────────
+  Widget _buildAutomaticAddress() {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -488,43 +646,58 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             const Text(
-              'Dirección o sector del puesto',
+              'Ubicación del puesto',
               style: TextStyle(color: Colors.white54, fontSize: 12),
             ),
             TextButton.icon(
               onPressed: _openMapPicker,
-              icon: const Icon(Icons.map_outlined, size: 14, color: Color(0xFF00E6A7)),
+              icon: const Icon(
+                Icons.map_outlined,
+                size: 14,
+                color: Color(0xFF00E6A7),
+              ),
               label: const Text(
                 'Marcar en el mapa',
                 style: TextStyle(color: Color(0xFF00E6A7), fontSize: 11),
               ),
-              style: TextButton.styleFrom(padding: EdgeInsets.zero, minimumSize: const Size(0, 0)),
+              style: TextButton.styleFrom(
+                padding: EdgeInsets.zero,
+                minimumSize: const Size(0, 0),
+              ),
             ),
           ],
         ),
         const SizedBox(height: 6),
-        TextField(
-          controller: _addressController,
-          style: const TextStyle(color: Colors.white, fontSize: 14),
-          onChanged: (_) => setState(() {}),
-          decoration: InputDecoration(
-            hintText: 'Ej: Carrera 96H #17 (Parque Central)',
-            hintStyle: const TextStyle(color: Colors.white24, fontSize: 13),
-            prefixIcon: const Icon(Icons.location_on_outlined, color: Color(0xFF00E6A7), size: 20),
-            suffixIcon: _puestoLat != null
-                ? const Icon(Icons.check_circle, color: Color(0xFF00E6A7), size: 18)
-                : null,
-            filled: true,
-            fillColor: const Color(0xFF1D2030),
-            contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-            border: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(12),
-              borderSide: BorderSide.none,
-            ),
-            focusedBorder: OutlineInputBorder(
-              borderRadius: BorderRadius.circular(12),
-              borderSide: const BorderSide(color: Color(0xFF00E6A7), width: 1.5),
-            ),
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.all(14),
+          decoration: BoxDecoration(
+            color: const Color(0xFF1D2030),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(
+            children: [
+              const Icon(
+                Icons.location_on_outlined,
+                color: Color(0xFF00E6A7),
+                size: 20,
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  _addressController.text.isEmpty
+                      ? 'Selecciona el punto en el mapa'
+                      : _addressController.text,
+                  style: const TextStyle(color: Colors.white70, fontSize: 13),
+                ),
+              ),
+              if (_puestoLat != null)
+                const Icon(
+                  Icons.check_circle,
+                  color: Color(0xFF00E6A7),
+                  size: 18,
+                ),
+            ],
           ),
         ),
         if (_puestoLat != null && _puestoLng != null) ...[
@@ -548,21 +721,23 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
           foregroundColor: Colors.black,
           elevation: 0,
           shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(14)),
+            borderRadius: BorderRadius.circular(14),
+          ),
         ),
         onPressed: _isLoading ? null : _saveChanges,
         child: _isLoading
             ? const SizedBox(
-          width: 20,
-          height: 20,
-          child: CircularProgressIndicator(
-              color: Colors.black, strokeWidth: 2),
-        )
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(
+                  color: Colors.black,
+                  strokeWidth: 2,
+                ),
+              )
             : const Text(
-          'Guardar cambios',
-          style: TextStyle(
-              fontWeight: FontWeight.bold, fontSize: 15),
-        ),
+                'Guardar cambios',
+                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+              ),
       ),
     );
   }
@@ -583,15 +758,21 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
               color: const Color(0xFF00E6A7).withOpacity(0.1),
               borderRadius: BorderRadius.circular(8),
             ),
-            child: const Icon(Icons.info_outline,
-                color: Color(0xFF00E6A7), size: 18),
+            child: const Icon(
+              Icons.info_outline,
+              color: Color(0xFF00E6A7),
+              size: 18,
+            ),
           ),
           const SizedBox(width: 12),
           const Expanded(
             child: Text(
               'Usa "Marcar en el mapa" para fijar la ubicación exacta de tu puesto. Esto permite que otros vendedores y alertas de emergencia te ubiquen correctamente.',
               style: TextStyle(
-                  color: Colors.white54, fontSize: 12, height: 1.4),
+                color: Colors.white54,
+                fontSize: 12,
+                height: 1.4,
+              ),
             ),
           ),
         ],
@@ -607,14 +788,17 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
         style: OutlinedButton.styleFrom(
           side: const BorderSide(color: Colors.redAccent, width: 1),
           shape: RoundedRectangleBorder(
-              borderRadius: BorderRadius.circular(14)),
+            borderRadius: BorderRadius.circular(14),
+          ),
         ),
         onPressed: _logout,
         icon: const Icon(Icons.logout, color: Colors.redAccent, size: 18),
         label: const Text(
           'Cerrar sesión',
           style: TextStyle(
-              color: Colors.redAccent, fontWeight: FontWeight.bold),
+            color: Colors.redAccent,
+            fontWeight: FontWeight.bold,
+          ),
         ),
       ),
     );

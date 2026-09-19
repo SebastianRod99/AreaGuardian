@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -10,6 +12,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../services/location_service.dart';
 import '../services/firestore_service.dart';
 import '../models/vendor_model.dart';
+import '../models/emergency_model.dart';
 
 // ==========================================
 // PANTALLA DE MAPA — OpenStreetMap + Firestore
@@ -46,11 +49,12 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   bool _isVendorRole = false;
 
   String _myPuestoTitle = 'Mi Puesto';
-  String _myVendorName = '';
   String _myAddress = '';
 
   // Lista de puestos dinámicos obtenidos desde Firebase Firestore
   List<VendorModel> _puestosVecinos = [];
+  List<EmergencyModel> _emergencies = [];
+  StreamSubscription<List<EmergencyModel>>? _emergencySubscription;
   VendorModel? _selectedVendorPuesto;
   bool _isMyPuestoSelected = false;
 
@@ -66,7 +70,6 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     setState(() {
       _isVendorRole = (prefs.getString('user_role') ?? '') == 'vendor';
       _myPuestoTitle = prefs.getString('puesto_title') ?? 'Mi Puesto';
-      _myVendorName = prefs.getString('vendor_name') ?? '';
       _myAddress = prefs.getString('vendor_address') ?? '';
     });
 
@@ -76,6 +79,12 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       setState(() {
         _locationDenied = true;
       });
+      _emergencySubscription?.cancel();
+      _emergencySubscription = _firestoreService
+          .watchActiveEmergencies()
+          .listen((emergencies) {
+            if (mounted) setState(() => _emergencies = emergencies);
+          });
     }
 
     try {
@@ -101,9 +110,12 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
 
       // 3. Consultamos los puestos reales directamente desde Firestore
       List<VendorModel> vendors = await _firestoreService.fetchNearbyVendors();
+      List<EmergencyModel> emergencies = await _firestoreService
+          .fetchActiveEmergencies();
 
       setState(() {
         _puestosVecinos = vendors;
+        _emergencies = emergencies;
         _isLoading = false;
       });
 
@@ -128,6 +140,12 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     }
   }
 
+  @override
+  void dispose() {
+    _emergencySubscription?.cancel();
+    super.dispose();
+  }
+
   void _centerOnMe() {
     if (_myLocation != null) {
       _mapController.move(_myLocation!, 17);
@@ -141,15 +159,35 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     });
   }
 
-  Future<void> _navigateTo(VendorModel puesto) async {
-    final lat = puesto.latitude;
-    final lng = puesto.longitude;
-    final uri = Uri.parse(
-      'https://www.google.com/maps/dir/?api=1&destination=$lat,$lng&travelmode=walking',
+  Future<void> _openDirections(VendorModel puesto) async {
+    final destination = '${puesto.latitude},${puesto.longitude}';
+    final geoUri = Uri.parse(
+      'geo:${puesto.latitude},${puesto.longitude}?q=$destination',
     );
-    if (await canLaunchUrl(uri)) {
-      await launchUrl(uri, mode: LaunchMode.externalApplication);
+    final googleUri = Uri.parse(
+      'https://www.google.com/maps/dir/?api=1&destination=$destination',
+    );
+
+    if (await canLaunchUrl(geoUri)) {
+      await launchUrl(geoUri, mode: LaunchMode.externalApplication);
+    } else if (await canLaunchUrl(googleUri)) {
+      await launchUrl(googleUri, mode: LaunchMode.externalApplication);
+    } else if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No se encontró una aplicación de mapas.'),
+        ),
+      );
     }
+  }
+
+  void _showVendorProfile(VendorModel puesto) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _VendorProfileSheet(puesto: puesto),
+    );
   }
 
   @override
@@ -167,21 +205,23 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
             Expanded(
               child: _isLoading
                   ? const Center(
-                child: CircularProgressIndicator(
-                    color: Color(0xFF00E6A7)),
-              )
+                      child: CircularProgressIndicator(
+                        color: Color(0xFF00E6A7),
+                      ),
+                    )
                   : Stack(
-                children: [
-                  _buildMap(),
-                  _buildLegend(),
-                  _buildCenterButton(),
-                  if (showingEmergency) _buildEmergencyBanner(),
-                  if (_locationDenied && !showingEmergency)
-                    _buildLocationWarning(),
-                  if (_selectedVendorPuesto != null || _isMyPuestoSelected)
-                    _buildPuestoCard(),
-                ],
-              ),
+                      children: [
+                        _buildMap(),
+                        _buildLegend(),
+                        _buildCenterButton(),
+                        if (showingEmergency) _buildEmergencyBanner(),
+                        if (_locationDenied && !showingEmergency)
+                          _buildLocationWarning(),
+                        if (_selectedVendorPuesto != null ||
+                            _isMyPuestoSelected)
+                          _buildPuestoCard(),
+                      ],
+                    ),
             ),
           ],
         ),
@@ -222,8 +262,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
             ),
             child: Row(
               children: const [
-                Icon(Icons.location_city,
-                    color: Color(0xFF00E6A7), size: 14),
+                Icon(Icons.location_city, color: Color(0xFF00E6A7), size: 14),
                 SizedBox(width: 6),
                 Text(
                   'Parque Central',
@@ -276,33 +315,15 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                 ),
               ),
 
-            // Yo — ubicación EN VIVO, ícono persona. Solo aplica al rol
-            // cliente (HU-06): confirma que su ubicación se está compartiendo
-            // mientras la guardia está activa.
-            if (!_isVendorRole && _myLocation != null)
-              Marker(
-                point: _myLocation!,
-                width: 40,
-                height: 40,
-                child: GestureDetector(
-                  onTap: () => ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(
-                      content: Text(
-                        'Esta es tu ubicación en tiempo real, compartida mientras la guardia está activa.',
-                      ),
-                      backgroundColor: Color(0xFF1D2030),
-                    ),
-                  ),
-                  child: _buildMarkerWidget(
-                    color: const Color(0xFF00E6A7),
-                    icon: Icons.person,
-                    isMe: true,
-                  ),
-                ),
+            // Marcador rojo de una emergencia activa.
+            ..._emergencies.map(
+              (emergency) => Marker(
+                point: LatLng(emergency.latitude, emergency.longitude),
+                width: 54,
+                height: 54,
+                child: _buildEmergencyMarker(),
               ),
-
-            // Marcador de la EMERGENCIA (HU-05) — solo si llegamos aquí
-            // desde una notificación push.
+            ),
             if (widget.focusLatitude != null && widget.focusLongitude != null)
               Marker(
                 point: LatLng(widget.focusLatitude!, widget.focusLongitude!),
@@ -314,10 +335,9 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                 ),
               ),
 
-            // Puestos de la red (Firestore): un marcador de PUESTO (fijo,
-            // tienda) y uno de DUEÑO (en vivo, persona) por cada vecino.
-            ..._puestosVecinos.expand((puesto) => [
-              Marker(
+            // Puestos de la red: únicamente su ubicación comercial fija.
+            ..._puestosVecinos.map(
+              (puesto) => Marker(
                 point: LatLng(puesto.latitude, puesto.longitude),
                 width: 40,
                 height: 40,
@@ -325,26 +345,34 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                   onTap: () => _selectVecino(puesto),
                   child: _buildMarkerWidget(
                     icon: Icons.store_outlined,
-                    color: puesto.isActive ? Colors.white : Colors.white24,
+                    color: puesto.isActive
+                        ? const Color(0xFF00E6A7)
+                        : Colors.grey,
                   ),
                 ),
               ),
-              Marker(
-                point: LatLng(puesto.currentLatitude, puesto.currentLongitude),
-                width: 36,
-                height: 36,
-                child: GestureDetector(
-                  onTap: () => _selectVecino(puesto),
-                  child: _buildMarkerWidget(
-                    icon: Icons.person,
-                    color: puesto.isActive ? Colors.white : Colors.white24,
-                  ),
-                ),
-              ),
-            ]),
+            ),
           ],
         ),
       ],
+    );
+  }
+
+  Widget _buildEmergencyMarker() {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.red.withOpacity(0.22),
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.red, width: 3),
+        boxShadow: const [
+          BoxShadow(color: Colors.redAccent, blurRadius: 12, spreadRadius: 2),
+        ],
+      ),
+      child: const Icon(
+        Icons.warning_amber_rounded,
+        color: Colors.red,
+        size: 28,
+      ),
     );
   }
 
@@ -388,11 +416,14 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _legendItem(const Color(0xFF00E6A7), _isVendorRole ? 'Mi puesto' : 'Yo'),
+            _legendItem(
+              const Color(0xFF00E6A7),
+              _isVendorRole ? 'Mi puesto' : 'Yo',
+            ),
             const SizedBox(height: 4),
-            _legendItem(Colors.white, 'Activo'),
+            _legendItem(const Color(0xFF00E6A7), 'Activo'),
             const SizedBox(height: 4),
-            _legendItem(Colors.white24, 'Inactivo'),
+            _legendItem(Colors.grey, 'Inactivo'),
           ],
         ),
       ),
@@ -408,8 +439,10 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
           decoration: BoxDecoration(shape: BoxShape.circle, color: color),
         ),
         const SizedBox(width: 6),
-        Text(label,
-            style: const TextStyle(color: Colors.white60, fontSize: 11)),
+        Text(
+          label,
+          style: const TextStyle(color: Colors.white60, fontSize: 11),
+        ),
       ],
     );
   }
@@ -430,14 +463,14 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
             borderRadius: BorderRadius.circular(12),
             border: Border.all(color: Colors.white12),
             boxShadow: [
-              BoxShadow(
-                color: Colors.black.withOpacity(0.3),
-                blurRadius: 6,
-              ),
+              BoxShadow(color: Colors.black.withOpacity(0.3), blurRadius: 6),
             ],
           ),
-          child: const Icon(Icons.my_location,
-              color: Color(0xFF00E6A7), size: 20),
+          child: const Icon(
+            Icons.my_location,
+            color: Color(0xFF00E6A7),
+            size: 20,
+          ),
         ),
       ),
     );
@@ -508,10 +541,15 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     final isMe = _isMyPuestoSelected;
     final puesto = _selectedVendorPuesto;
 
-    String title = isMe ? _myPuestoTitle : (puesto?.shopName ?? 'Puesto Comercial');
-    String subtitle = isMe ? _myVendorName : (puesto?.category ?? '');
-    String address = isMe ? (_myAddress.isNotEmpty ? _myAddress : 'Sin dirección registrada') : 'Nequi: ${puesto?.nequiNumber ?? "N/A"}';
-    bool isActive = isMe ? true : (puesto?.isActive ?? false);
+    final title = isMe
+        ? _myPuestoTitle
+        : (puesto?.shopName ?? 'Puesto Comercial');
+    final address = isMe
+        ? (_myAddress.isNotEmpty ? _myAddress : 'Sin dirección registrada')
+        : (puesto?.address.isNotEmpty == true
+              ? puesto!.address
+              : 'Dirección no registrada');
+    final isActive = isMe || (puesto?.isActive ?? false);
 
     return Positioned(
       bottom: 0,
@@ -554,9 +592,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                   child: Icon(
                     isMe ? Icons.storefront : Icons.store_outlined,
                     size: 26,
-                    color: isMe
-                        ? const Color(0xFF00E6A7)
-                        : Colors.white54,
+                    color: isMe ? const Color(0xFF00E6A7) : Colors.white54,
                   ),
                 ),
                 const SizedBox(width: 14),
@@ -577,28 +613,25 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                             ),
                           ),
                           const SizedBox(width: 8),
-                          _buildBadge(isMe, isActive),
+                          _buildStatusBadge(isActive),
                         ],
                       ),
-                      if (subtitle.isNotEmpty) ...[
-                        const SizedBox(height: 4),
-                        Text(
-                          subtitle,
-                          style: const TextStyle(
-                              color: Colors.white60, fontSize: 13),
-                        ),
-                      ],
                       const SizedBox(height: 3),
                       Row(
                         children: [
-                          const Icon(Icons.location_on,
-                              size: 12, color: Colors.white38),
+                          const Icon(
+                            Icons.location_on,
+                            size: 12,
+                            color: Colors.white38,
+                          ),
                           const SizedBox(width: 4),
                           Expanded(
                             child: Text(
                               address,
                               style: const TextStyle(
-                                  color: Colors.white38, fontSize: 12),
+                                color: Colors.white38,
+                                fontSize: 12,
+                              ),
                               overflow: TextOverflow.ellipsis,
                             ),
                           ),
@@ -609,111 +642,171 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                 ),
               ],
             ),
-            const SizedBox(height: 16),
-
-            // Botones según sea tu puesto o el de un vecino
-            if (!isMe && puesto != null)
+            if (!isMe && puesto != null) ...[
+              const SizedBox(height: 16),
               Row(
                 children: [
                   Expanded(
                     child: OutlinedButton.icon(
+                      onPressed: () => _openDirections(puesto),
+                      icon: const Icon(Icons.directions, size: 18),
+                      label: const Text('Cómo llegar'),
                       style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.white70,
                         side: const BorderSide(color: Colors.white24),
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12)),
-                        padding: const EdgeInsets.symmetric(vertical: 12),
                       ),
-                      onPressed: () {
-                        _mapController.move(LatLng(puesto.latitude, puesto.longitude), 18);
-                        setState(() {
-                          _selectedVendorPuesto = null;
-                        });
-                      },
-                      icon: const Icon(Icons.center_focus_strong,
-                          color: Colors.white60, size: 18),
-                      label: const Text('Ver en mapa',
-                          style: TextStyle(
-                              color: Colors.white60, fontSize: 13)),
                     ),
                   ),
                   const SizedBox(width: 10),
                   Expanded(
                     child: ElevatedButton.icon(
+                      onPressed: () => _showVendorProfile(puesto),
+                      icon: const Icon(Icons.storefront, size: 18),
+                      label: const Text('Ver perfil'),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: const Color(0xFF00E6A7),
                         foregroundColor: Colors.black,
                         elevation: 0,
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12)),
-                        padding: const EdgeInsets.symmetric(vertical: 12),
                       ),
-                      onPressed: () => _navigateTo(puesto),
-                      icon: const Icon(Icons.directions_walk, size: 18),
-                      label: const Text('Navegar',
-                          style: TextStyle(
-                              fontWeight: FontWeight.bold, fontSize: 13)),
                     ),
                   ),
                 ],
               ),
-
-            if (isMe)
-              SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  style: OutlinedButton.styleFrom(
-                    side: BorderSide(
-                        color: const Color(0xFF00E6A7).withOpacity(0.4)),
-                    shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12)),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                  ),
-                  onPressed: () => setState(() {
-                    _isMyPuestoSelected = false;
-                  }),
-                  icon: const Icon(Icons.check_circle_outline,
-                      color: Color(0xFF00E6A7), size: 18),
-                  label: const Text('Este es mi puesto',
-                      style: TextStyle(
-                          color: Color(0xFF00E6A7),
-                          fontWeight: FontWeight.bold)),
-                ),
-              ),
+            ],
           ],
         ),
       ),
     );
   }
 
-  Widget _buildBadge(bool isMe, bool isActive) {
-    if (isMe) {
-      return Container(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-        decoration: BoxDecoration(
-          color: const Color(0xFF00E6A7).withOpacity(0.15),
-          borderRadius: BorderRadius.circular(6),
-        ),
-        child: const Text('Tú',
-            style: TextStyle(
-                color: Color(0xFF00E6A7),
-                fontSize: 10,
-                fontWeight: FontWeight.bold)),
-      );
-    }
+  Widget _buildStatusBadge(bool isActive) {
+    final color = isActive ? const Color(0xFF00E6A7) : Colors.grey;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
       decoration: BoxDecoration(
-        color: isActive
-            ? Colors.green.withOpacity(0.15)
-            : Colors.white.withOpacity(0.06),
+        color: color.withOpacity(0.16),
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
         isActive ? 'Activo' : 'Inactivo',
         style: TextStyle(
-          color: isActive ? Colors.greenAccent : Colors.white38,
+          color: color,
           fontSize: 10,
           fontWeight: FontWeight.bold,
+        ),
+      ),
+    );
+  }
+}
+
+class _VendorProfileSheet extends StatelessWidget {
+  final VendorModel puesto;
+
+  const _VendorProfileSheet({required this.puesto});
+
+  @override
+  Widget build(BuildContext context) {
+    final paymentMethods = <String>[
+      if (puesto.nequiNumber.trim().isNotEmpty)
+        'Nequi: ${puesto.nequiNumber.trim()}',
+      if (puesto.daviplataNumber.trim().isNotEmpty)
+        'Daviplata: ${puesto.daviplataNumber.trim()}',
+    ];
+
+    return SafeArea(
+      child: Container(
+        constraints: const BoxConstraints(maxHeight: 620),
+        padding: const EdgeInsets.fromLTRB(20, 12, 20, 24),
+        decoration: const BoxDecoration(
+          color: Color(0xFF1D2030),
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+        ),
+        child: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: Colors.white24,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
+              Text(
+                puesto.shopName,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 6),
+              Text(
+                puesto.address.isEmpty
+                    ? 'Dirección no registrada'
+                    : puesto.address,
+                style: const TextStyle(color: Colors.white60, fontSize: 13),
+              ),
+              const SizedBox(height: 22),
+              const Text(
+                'Catálogo / menú',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 8),
+              if (puesto.catalog.isEmpty)
+                const Text(
+                  'El negocio aún no ha publicado productos.',
+                  style: TextStyle(color: Colors.white54, fontSize: 13),
+                )
+              else
+                ...puesto.catalog.map(
+                  (item) => ListTile(
+                    dense: true,
+                    contentPadding: EdgeInsets.zero,
+                    leading: const Icon(
+                      Icons.check_circle_outline,
+                      color: Color(0xFF00E6A7),
+                      size: 18,
+                    ),
+                    title: Text(
+                      item,
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                  ),
+                ),
+              const SizedBox(height: 16),
+              const Text(
+                'Pagos digitales',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 8),
+              if (paymentMethods.isEmpty)
+                const Text(
+                  'No hay medios de pago publicados.',
+                  style: TextStyle(color: Colors.white54, fontSize: 13),
+                )
+              else
+                ...paymentMethods.map(
+                  (method) => Padding(
+                    padding: const EdgeInsets.only(bottom: 6),
+                    child: Text(
+                      method,
+                      style: const TextStyle(color: Colors.white70),
+                    ),
+                  ),
+                ),
+            ],
+          ),
         ),
       ),
     );

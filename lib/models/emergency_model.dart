@@ -1,3 +1,5 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+
 class EmergencyModel {
   final String id;
   final String userId;
@@ -42,14 +44,19 @@ class EmergencyModel {
       userName: json['userName'] ?? '',
       latitude: json['latitude']?.toDouble() ?? 0.0,
       longitude: json['longitude']?.toDouble() ?? 0.0,
-      timestamp: json['timestamp'] != null
-          ? DateTime.parse(json['timestamp'])
-          : DateTime.now(),
+      timestamp: _parseTimestamp(json['timestamp']),
       status: json['status'] ?? 'active',
-      notifiedVendorIds: (json['notifiedVendorIds'] as List<dynamic>?)
-          ?.map((e) => e.toString())
-          .toList() ??
+      notifiedVendorIds:
+          (json['notifiedVendorIds'] as List<dynamic>?)
+              ?.map((e) => e.toString())
+              .toList() ??
           const [],
     );
+  }
+
+  static DateTime _parseTimestamp(dynamic value) {
+    if (value is Timestamp) return value.toDate();
+    if (value is String) return DateTime.tryParse(value) ?? DateTime.now();
+    return DateTime.now();
   }
 }

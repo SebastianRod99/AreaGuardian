@@ -12,7 +12,20 @@
           "package_name": "com.example.areaguardian"
         }
       },
-      "oauth_client": [],
+      "oauth_client": [
+        {
+          "client_id": "967999112644-2sddkra4k9fh5lt1g1mi31v5ibkmkor6.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.example.areaguardian",
+            "certificate_hash": "d12d4242c8b842a58cbdf8ab20b6386f11e4a37e"
+          }
+        },
+        {
+          "client_id": "967999112644-ei5nn3ats7u9v5kkig7dq46rnrbu2u13.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
       "api_key": [
         {
           "current_key": "AIzaSyD1CDco2VhUD3SFZ_Rj6TJyjU6fJ0pSs0g"
@@ -20,7 +33,12 @@
       ],
       "services": {
         "appinvite_service": {
-          "other_platform_oauth_client": []
+          "other_platform_oauth_client": [
+            {
+              "client_id": "967999112644-ei5nn3ats7u9v5kkig7dq46rnrbu2u13.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
         }
       }
     }

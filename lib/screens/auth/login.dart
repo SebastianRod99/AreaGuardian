@@ -1,38 +1,59 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:areaguardian/widgets/bar_nav.dart';
+import 'package:areaguardian/services/auth_service.dart';
 import 'package:areaguardian/screens/map_dashboard_screen.dart';
+
 import 'register.dart';
 
 // ==========================================
 // SECCIÓN DE PANTALLA DE LOGIN (SOCIAL)
 // ==========================================
-class LoginScreen extends StatelessWidget {
+class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
 
-  // Simula el proceso de autenticación con Google o Apple
-  Future<void> _handleSocialLogin(BuildContext context, String provider) async {
-    final prefs = await SharedPreferences.getInstance();
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
 
-    // Marcamos que el usuario ya inició sesión
-    await prefs.setBool('is_logged_in', true);
+class _LoginScreenState extends State<LoginScreen> {
+  final AuthService _authService = AuthService();
+  bool _isLoading = false;
+  String? _errorMessage;
 
-    // Verificamos si ya tiene un puesto registrado previamente
-    bool isRegistered = prefs.getBool('is_registered') ?? false;
+  Future<void> _signInWithGoogle() async {
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
 
-    if (!context.mounted) return;
+    try {
+      await _authService.signInWithGoogle();
+      final prefs = await SharedPreferences.getInstance();
+      final uid = _authService.currentUser!.uid;
+      final previousUid = prefs.getString('auth_uid');
+      final isSameAccount = previousUid == uid;
+      await prefs.setString('auth_uid', uid);
+      await prefs.setBool('is_logged_in', true);
+      final isRegistered =
+          isSameAccount && (prefs.getBool('is_registered') ?? false);
 
-    if (isRegistered) {
-      // Si ya está registrado, va directo al mapa con su puesto activo
+      if (!mounted) return;
       Navigator.pushReplacement(
         context,
-        MaterialPageRoute(builder: (context) => const MapDashboardScreen()),
+        MaterialPageRoute(
+          builder: (_) =>
+              isRegistered ? const AppShell(initialIndex: 0) : const Register(),
+        ),
       );
-    } else {
-      // Si es su primera vez, lo enviamos a registrar los datos de su puesto
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(builder: (context) => const Register()),
-      );
+    } on FirebaseAuthException catch (error) {
+      if (mounted) setState(() => _errorMessage = error.message ?? error.code);
+    } catch (error) {
+      if (mounted)
+        setState(() => _errorMessage = 'No se pudo iniciar sesión: $error');
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
     }
   }
 
@@ -55,7 +76,11 @@ class LoginScreen extends StatelessWidget {
               const Text(
                 'AreaGuardian',
                 textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: Colors.white),
+                style: TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.white,
+                ),
               ),
               const SizedBox(height: 8),
               const Text(
@@ -65,50 +90,58 @@ class LoginScreen extends StatelessWidget {
               ),
               const SizedBox(height: 50),
 
-              // ==========================================
-              // SECCIÓN DE BOTÓN GOOGLE
-              // ==========================================
+              if (_errorMessage != null)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 16),
+                  child: Text(
+                    _errorMessage!,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Colors.redAccent),
+                  ),
+                ),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(
                   backgroundColor: Colors.white,
                   foregroundColor: Colors.black,
                   padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
                 ),
-                onPressed: () => _handleSocialLogin(context, 'Google'),
+                onPressed: _isLoading ? null : _signInWithGoogle,
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.center,
-                  children: const [
-                    Icon(Icons.g_mobiledata, size: 28, color: Colors.black),
-                    SizedBox(width: 8),
-                    Text('Continuar con Google', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
+                  children: [
+                    const Icon(
+                      Icons.g_mobiledata,
+                      size: 28,
+                      color: Colors.black,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      _isLoading
+                          ? 'Conectando...'
+                          : 'Iniciar sesión con Google',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 15,
+                      ),
+                    ),
                   ],
                 ),
               ),
-              const SizedBox(height: 16),
-
-              // ==========================================
-              // SECCIÓN DE BOTÓN APPLE
-              // ==========================================
-              ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.black,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                    side: const BorderSide(color: Colors.white24),
-                  ),
-                ),
-                onPressed: () => _handleSocialLogin(context, 'Apple'),
-                child: Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: const [
-                    Icon(Icons.apple, size: 26, color: Colors.white),
-                    SizedBox(width: 8),
-                    Text('Continuar con Apple', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
-                  ],
-                ),
+              const SizedBox(height: 12),
+              TextButton.icon(
+                onPressed: _isLoading
+                    ? null
+                    : () => Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const MapDashboardScreen(),
+                        ),
+                      ),
+                icon: const Icon(Icons.map_outlined),
+                label: const Text('Explorar el mapa sin iniciar sesión'),
               ),
             ],
           ),

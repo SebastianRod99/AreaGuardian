@@ -1,10 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:sensors_plus/sensors_plus.dart';
+
 import 'dart:async';
+
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
+
 import 'emergency.dart'; // Importa tu servicio centralizado
+
 import 'package:vibration/vibration.dart';
+import 'package:areaguardian/services/firestore_service.dart';
+import 'package:areaguardian/services/location_service.dart';
 
 // ==========================================
 // PANTALLA DEDICADA DE SEGURIDAD (TAB 1)
@@ -23,6 +29,8 @@ class _SecurityScreenState extends State<SecurityScreen>
   String emergencyContact = 'Sin contacto de emergencia';
   int shakeCount = 0;
   DateTime? lastShakeTime;
+  DateTime? _lastAlertTime;
+  String? _activeEmergencyId;
 
   StreamSubscription? _accelSub;
   late AudioPlayer _audioPlayer;
@@ -39,9 +47,10 @@ class _SecurityScreenState extends State<SecurityScreen>
       vsync: this,
       duration: const Duration(milliseconds: 900),
     )..repeat(reverse: true);
-    _pulseAnim = Tween<double>(begin: 0.93, end: 1.07).animate(
-      CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut),
-    );
+    _pulseAnim = Tween<double>(
+      begin: 0.93,
+      end: 1.07,
+    ).animate(CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
   }
 
   Future<void> _initAudio() async {
@@ -56,7 +65,8 @@ class _SecurityScreenState extends State<SecurityScreen>
   Future<void> _loadContact() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
-      emergencyContact = prefs.getString('contact') ?? 'Sin contacto de emergencia';
+      emergencyContact =
+          prefs.getString('contact') ?? 'Sin contacto de emergencia';
     });
   }
 
@@ -71,14 +81,21 @@ class _SecurityScreenState extends State<SecurityScreen>
     });
     _accelSub = accelerometerEvents.listen((event) {
       if (!isProtected || isAlarmActive) return;
-      double g = (event.x * event.x + event.y * event.y + event.z * event.z) / (9.8 * 9.8);
+      double g =
+          (event.x * event.x + event.y * event.y + event.z * event.z) /
+          (9.8 * 9.8);
       if (g > 3.0) {
         final now = DateTime.now();
+        if (_lastAlertTime != null &&
+            now.difference(_lastAlertTime!) < const Duration(seconds: 5)) {
+          return;
+        }
         if (lastShakeTime == null ||
-            now.difference(lastShakeTime!) > const Duration(milliseconds: 500)) {
+            now.difference(lastShakeTime!) >
+                const Duration(milliseconds: 500)) {
           lastShakeTime = now;
           setState(() => shakeCount++);
-          if (shakeCount >= 3) _triggerAlarm();
+          if (shakeCount >= 4) _triggerAlarm();
         }
       }
     });
@@ -93,8 +110,36 @@ class _SecurityScreenState extends State<SecurityScreen>
   }
 
   void _triggerAlarm() async {
+    final prefs = await SharedPreferences.getInstance();
+    final position = await LocationService().getCurrentLocationForEmergency();
+    if (position == null) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No se pudo obtener tu ubicación exacta.'),
+          ),
+        );
+      }
+      return;
+    }
+
+    final userId =
+        prefs.getString('user_id') ?? prefs.getString('client_id') ?? '';
+    final userName =
+        prefs.getString('user_name') ??
+        prefs.getString('vendor_name') ??
+        'Usuario AreaGuardian';
+    final emergency = await FirestoreService().createEmergency(
+      userId: userId,
+      userName: userName,
+      latitude: position.latitude,
+      longitude: position.longitude,
+    );
+    _activeEmergencyId = emergency.id;
+    _lastAlertTime = DateTime.now();
+
     if (await Vibration.hasVibrator() ?? false) {
-      Vibration.vibrate(duration: 500); // Vibra durante 500ms
+      await Vibration.vibrate(pattern: [0, 100, 100, 100, 100, 100]);
     }
     setState(() {
       isAlarmActive = true;
@@ -103,11 +148,14 @@ class _SecurityScreenState extends State<SecurityScreen>
     await EmergencyAlertService.sendSMSAlert(context);
     await _audioPlayer.seek(Duration.zero);
     await _audioPlayer.play();
-
   }
 
   void _cancelAlarm() async {
     await _audioPlayer.stop();
+    if (_activeEmergencyId != null) {
+      await FirestoreService().resolveEmergency(_activeEmergencyId!);
+      _activeEmergencyId = null;
+    }
     setState(() {
       isAlarmActive = false;
       shakeCount = 0;
@@ -145,7 +193,7 @@ class _SecurityScreenState extends State<SecurityScreen>
               const SizedBox(height: 4),
               Text(
                 isProtected
-                    ? 'Guardia activa — agita 3 veces para alertar'
+                    ? 'Guardia activa — agita 4 veces para alertar'
                     : 'Activa la guardia para comenzar',
                 style: const TextStyle(color: Colors.white54, fontSize: 13),
               ),
@@ -197,37 +245,48 @@ class _SecurityScreenState extends State<SecurityScreen>
                 Center(
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
-                    children: List.generate(3, (i) => AnimatedContainer(
-                      duration: const Duration(milliseconds: 200),
-                      margin: const EdgeInsets.symmetric(horizontal: 6),
-                      width: i < shakeCount ? 16 : 12,
-                      height: i < shakeCount ? 16 : 12,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: i < shakeCount
-                            ? const Color(0xFF00E6A7)
-                            : Colors.white12,
+                    children: List.generate(
+                      4,
+                      (i) => AnimatedContainer(
+                        duration: const Duration(milliseconds: 200),
+                        margin: const EdgeInsets.symmetric(horizontal: 6),
+                        width: i < shakeCount ? 16 : 12,
+                        height: i < shakeCount ? 16 : 12,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: i < shakeCount
+                              ? const Color(0xFF00E6A7)
+                              : Colors.white12,
+                        ),
                       ),
-                    )),
+                    ),
                   ),
                 ),
               const Spacer(),
               Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
+                ),
                 decoration: BoxDecoration(
                   color: const Color(0xFF1D2030),
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.person_outline,
-                        color: Color(0xFF00E6A7), size: 18),
+                    const Icon(
+                      Icons.person_outline,
+                      color: Color(0xFF00E6A7),
+                      size: 18,
+                    ),
                     const SizedBox(width: 10),
                     Expanded(
                       child: Text(
                         emergencyContact,
                         style: const TextStyle(
-                            color: Colors.white70, fontSize: 13),
+                          color: Colors.white70,
+                          fontSize: 13,
+                        ),
                         overflow: TextOverflow.ellipsis,
                       ),
                     ),
@@ -243,13 +302,16 @@ class _SecurityScreenState extends State<SecurityScreen>
                     backgroundColor: isProtected
                         ? Colors.white10
                         : const Color(0xFF00E6A7),
-                    foregroundColor:
-                    isProtected ? Colors.white60 : Colors.black,
+                    foregroundColor: isProtected
+                        ? Colors.white60
+                        : Colors.black,
                     elevation: 0,
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(14),
                       side: BorderSide(
-                        color: isProtected ? Colors.white24 : Colors.transparent,
+                        color: isProtected
+                            ? Colors.white24
+                            : Colors.transparent,
                       ),
                     ),
                   ),
@@ -265,6 +327,24 @@ class _SecurityScreenState extends State<SecurityScreen>
                 ),
               ),
               const SizedBox(height: 12),
+              if (isProtected && !isAlarmActive)
+                SizedBox(
+                  width: double.infinity,
+                  height: 50,
+                  child: OutlinedButton.icon(
+                    onPressed: _triggerAlarm,
+                    icon: const Icon(Icons.warning_amber_rounded),
+                    label: const Text('ACTIVAR EMERGENCIA AHORA'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.redAccent,
+                      side: const BorderSide(color: Colors.redAccent),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                  ),
+                ),
+              if (isProtected && !isAlarmActive) const SizedBox(height: 12),
               Container(
                 padding: const EdgeInsets.all(14),
                 decoration: BoxDecoration(
@@ -277,7 +357,7 @@ class _SecurityScreenState extends State<SecurityScreen>
                     SizedBox(width: 10),
                     Expanded(
                       child: Text(
-                        '① Activa la guardia  ② Guarda el celular en el bolsillo  ③ Agita con fuerza 3 veces',
+                        '① Activa la guardia  ② Guarda el celular en el bolsillo  ③ Agita con fuerza 4 veces',
                         style: TextStyle(
                           color: Colors.white38,
                           fontSize: 12,
@@ -315,9 +395,10 @@ class _SecurityScreenState extends State<SecurityScreen>
                   child: Text(
                     '🚨 ALERTA DE EMERGENCIA ACTIVA',
                     style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                        fontSize: 15),
+                      color: Colors.white,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 15,
+                    ),
                   ),
                 ),
               ),
@@ -331,37 +412,50 @@ class _SecurityScreenState extends State<SecurityScreen>
                   border: Border.all(color: Colors.red, width: 3),
                 ),
                 child: const Center(
-                  child: Icon(Icons.warning_amber_rounded,
-                      size: 70, color: Colors.red),
+                  child: Icon(
+                    Icons.warning_amber_rounded,
+                    size: 70,
+                    color: Colors.red,
+                  ),
                 ),
               ),
               const SizedBox(height: 20),
               const Text(
                 'EMERGENCIA',
                 style: TextStyle(
-                    fontSize: 24,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.red,
-                    letterSpacing: 2),
+                  fontSize: 24,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.red,
+                  letterSpacing: 2,
+                ),
               ),
               const SizedBox(height: 6),
-              const Text('¡Toca CANCELAR si fue un error!',
-                  style: TextStyle(color: Colors.white60)),
+              const Text(
+                '¡Toca CANCELAR si fue un error!',
+                style: TextStyle(color: Colors.white60),
+              ),
               const Spacer(),
               Container(
                 padding: const EdgeInsets.symmetric(
-                    horizontal: 16, vertical: 12),
+                  horizontal: 16,
+                  vertical: 12,
+                ),
                 decoration: BoxDecoration(
                   color: const Color(0xFF1D2030),
                   borderRadius: BorderRadius.circular(12),
                 ),
                 child: Row(
                   children: [
-                    const Icon(Icons.person_outline,
-                        color: Colors.white54, size: 18),
+                    const Icon(
+                      Icons.person_outline,
+                      color: Colors.white54,
+                      size: 18,
+                    ),
                     const SizedBox(width: 10),
-                    Text(emergencyContact,
-                        style: const TextStyle(color: Colors.white70)),
+                    Text(
+                      emergencyContact,
+                      style: const TextStyle(color: Colors.white70),
+                    ),
                   ],
                 ),
               ),
@@ -373,16 +467,20 @@ class _SecurityScreenState extends State<SecurityScreen>
                   style: OutlinedButton.styleFrom(
                     side: const BorderSide(color: Colors.white24),
                     shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12)),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
                   ),
                   onPressed: () {
                     _cancelAlarm();
                     _deactivate();
                   },
-                  child: const Text('DESACTIVAR GUARDIA',
-                      style: TextStyle(
-                          color: Colors.white60,
-                          fontWeight: FontWeight.bold)),
+                  child: const Text(
+                    'DESACTIVAR GUARDIA',
+                    style: TextStyle(
+                      color: Colors.white60,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
                 ),
               ),
               const SizedBox(height: 10),
@@ -393,12 +491,17 @@ class _SecurityScreenState extends State<SecurityScreen>
                   style: OutlinedButton.styleFrom(
                     side: const BorderSide(color: Colors.red),
                     shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(12)),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
                   ),
                   onPressed: _cancelAlarm,
-                  child: const Text('✕  CANCELAR ALARMA — Fue un error',
-                      style: TextStyle(
-                          color: Colors.red, fontWeight: FontWeight.bold)),
+                  child: const Text(
+                    '✕  CANCELAR ALARMA — Fue un error',
+                    style: TextStyle(
+                      color: Colors.red,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
                 ),
               ),
               const SizedBox(height: 8),
