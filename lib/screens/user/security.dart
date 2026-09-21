@@ -1,8 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:sensors_plus/sensors_plus.dart';
-
-import 'dart:async';
-
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:just_audio/just_audio.dart';
 
@@ -11,6 +7,7 @@ import 'emergency.dart'; // Importa tu servicio centralizado
 import 'package:vibration/vibration.dart';
 import 'package:areaguardian/services/firestore_service.dart';
 import 'package:areaguardian/services/location_service.dart';
+import 'package:areaguardian/services/protection_service.dart';
 
 // ==========================================
 // PANTALLA DEDICADA DE SEGURIDAD (TAB 1)
@@ -24,15 +21,11 @@ class SecurityScreen extends StatefulWidget {
 
 class _SecurityScreenState extends State<SecurityScreen>
     with TickerProviderStateMixin {
-  bool isProtected = false;
-  bool isAlarmActive = false;
+  final ProtectionService _protectionService = ProtectionService.shared;
   String emergencyContact = 'Sin contacto de emergencia';
-  int shakeCount = 0;
-  DateTime? lastShakeTime;
   DateTime? _lastAlertTime;
   String? _activeEmergencyId;
 
-  StreamSubscription? _accelSub;
   late AudioPlayer _audioPlayer;
   late AnimationController _pulseCtrl;
   late Animation<double> _pulseAnim;
@@ -43,6 +36,8 @@ class _SecurityScreenState extends State<SecurityScreen>
     _audioPlayer = AudioPlayer();
     _initAudio();
     _loadContact();
+    _protectionService.addListener(_onProtectionChanged);
+    _protectionService.onEmergencyTriggered = _triggerAlarm;
     _pulseCtrl = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 900),
@@ -70,43 +65,20 @@ class _SecurityScreenState extends State<SecurityScreen>
     });
   }
 
+  void _onProtectionChanged() {
+    if (mounted) setState(() {});
+  }
+
   void _toggleGuardia() {
-    isProtected ? _deactivate() : _activate();
+    _protectionService.isProtected ? _deactivate() : _activate();
   }
 
   void _activate() {
-    setState(() {
-      isProtected = true;
-      shakeCount = 0;
-    });
-    _accelSub = accelerometerEvents.listen((event) {
-      if (!isProtected || isAlarmActive) return;
-      double g =
-          (event.x * event.x + event.y * event.y + event.z * event.z) /
-          (9.8 * 9.8);
-      if (g > 3.0) {
-        final now = DateTime.now();
-        if (_lastAlertTime != null &&
-            now.difference(_lastAlertTime!) < const Duration(seconds: 5)) {
-          return;
-        }
-        if (lastShakeTime == null ||
-            now.difference(lastShakeTime!) >
-                const Duration(milliseconds: 500)) {
-          lastShakeTime = now;
-          setState(() => shakeCount++);
-          if (shakeCount >= 4) _triggerAlarm();
-        }
-      }
-    });
+    _protectionService.activate();
   }
 
   void _deactivate() {
-    _accelSub?.cancel();
-    setState(() {
-      isProtected = false;
-      shakeCount = 0;
-    });
+    _protectionService.deactivate();
   }
 
   void _triggerAlarm() async {
@@ -136,15 +108,13 @@ class _SecurityScreenState extends State<SecurityScreen>
       longitude: position.longitude,
     );
     _activeEmergencyId = emergency.id;
+    _protectionService.setActiveEmergencyId(emergency.id);
     _lastAlertTime = DateTime.now();
 
     if (await Vibration.hasVibrator() ?? false) {
       await Vibration.vibrate(pattern: [0, 100, 100, 100, 100, 100]);
     }
-    setState(() {
-      isAlarmActive = true;
-      shakeCount = 0;
-    });
+    _protectionService.markAlarmActive();
     await EmergencyAlertService.sendSMSAlert(context);
     await _audioPlayer.seek(Duration.zero);
     await _audioPlayer.play();
@@ -152,19 +122,18 @@ class _SecurityScreenState extends State<SecurityScreen>
 
   void _cancelAlarm() async {
     await _audioPlayer.stop();
-    if (_activeEmergencyId != null) {
-      await FirestoreService().resolveEmergency(_activeEmergencyId!);
+    final emergencyId = _protectionService.activeEmergencyId;
+    if (emergencyId != null) {
+      await FirestoreService().resolveEmergency(emergencyId);
+      _protectionService.clearActiveEmergencyId();
       _activeEmergencyId = null;
     }
-    setState(() {
-      isAlarmActive = false;
-      shakeCount = 0;
-    });
+    _protectionService.clearAlarm();
   }
 
   @override
   void dispose() {
-    _accelSub?.cancel();
+    _protectionService.removeListener(_onProtectionChanged);
     _audioPlayer.dispose();
     _pulseCtrl.dispose();
     super.dispose();
@@ -172,7 +141,7 @@ class _SecurityScreenState extends State<SecurityScreen>
 
   @override
   Widget build(BuildContext context) {
-    if (isAlarmActive) return _buildEmergency();
+    if (_protectionService.isAlarmActive) return _buildEmergency();
 
     return Scaffold(
       backgroundColor: const Color(0xFF121420),
@@ -192,7 +161,7 @@ class _SecurityScreenState extends State<SecurityScreen>
               ),
               const SizedBox(height: 4),
               Text(
-                isProtected
+                _protectionService.isProtected
                     ? 'Guardia activa — agita 4 veces para alertar'
                     : 'Activa la guardia para comenzar',
                 style: const TextStyle(color: Colors.white54, fontSize: 13),
@@ -206,20 +175,22 @@ class _SecurityScreenState extends State<SecurityScreen>
                     height: 180,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      color: isProtected
+                      color: _protectionService.isProtected
                           ? const Color(0xFF00E6A7).withOpacity(0.08)
                           : Colors.white.withOpacity(0.04),
                       border: Border.all(
-                        color: isProtected
+                        color: _protectionService.isProtected
                             ? const Color(0xFF00E6A7)
                             : Colors.white24,
                         width: 3,
                       ),
                     ),
                     child: Icon(
-                      isProtected ? Icons.security : Icons.security_outlined,
+                      _protectionService.isProtected
+                          ? Icons.security
+                          : Icons.security_outlined,
                       size: 80,
-                      color: isProtected
+                      color: _protectionService.isProtected
                           ? const Color(0xFF00E6A7)
                           : Colors.white24,
                     ),
@@ -229,19 +200,19 @@ class _SecurityScreenState extends State<SecurityScreen>
               const SizedBox(height: 24),
               Center(
                 child: Text(
-                  isProtected ? 'PROTEGIDO' : 'INACTIVO',
+                  _protectionService.isProtected ? 'PROTEGIDO' : 'INACTIVO',
                   style: TextStyle(
                     fontSize: 22,
                     fontWeight: FontWeight.bold,
                     letterSpacing: 3,
-                    color: isProtected
+                    color: _protectionService.isProtected
                         ? const Color(0xFF00E6A7)
                         : Colors.white24,
                   ),
                 ),
               ),
               const SizedBox(height: 16),
-              if (isProtected)
+              if (_protectionService.isProtected)
                 Center(
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
@@ -250,11 +221,11 @@ class _SecurityScreenState extends State<SecurityScreen>
                       (i) => AnimatedContainer(
                         duration: const Duration(milliseconds: 200),
                         margin: const EdgeInsets.symmetric(horizontal: 6),
-                        width: i < shakeCount ? 16 : 12,
-                        height: i < shakeCount ? 16 : 12,
+                        width: i < _protectionService.shakeCount ? 16 : 12,
+                        height: i < _protectionService.shakeCount ? 16 : 12,
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
-                          color: i < shakeCount
+                          color: i < _protectionService.shakeCount
                               ? const Color(0xFF00E6A7)
                               : Colors.white12,
                         ),
@@ -299,17 +270,17 @@ class _SecurityScreenState extends State<SecurityScreen>
                 height: 54,
                 child: ElevatedButton(
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: isProtected
+                    backgroundColor: _protectionService.isProtected
                         ? Colors.white10
                         : const Color(0xFF00E6A7),
-                    foregroundColor: isProtected
+                    foregroundColor: _protectionService.isProtected
                         ? Colors.white60
                         : Colors.black,
                     elevation: 0,
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(14),
                       side: BorderSide(
-                        color: isProtected
+                        color: _protectionService.isProtected
                             ? Colors.white24
                             : Colors.transparent,
                       ),
@@ -317,7 +288,9 @@ class _SecurityScreenState extends State<SecurityScreen>
                   ),
                   onPressed: _toggleGuardia,
                   child: Text(
-                    isProtected ? 'DESACTIVAR GUARDIA' : 'ACTIVAR GUARDIA',
+                    _protectionService.isProtected
+                        ? 'DESACTIVAR GUARDIA'
+                        : 'ACTIVAR GUARDIA',
                     style: const TextStyle(
                       fontWeight: FontWeight.bold,
                       fontSize: 15,
@@ -327,7 +300,8 @@ class _SecurityScreenState extends State<SecurityScreen>
                 ),
               ),
               const SizedBox(height: 12),
-              if (isProtected && !isAlarmActive)
+              if (_protectionService.isProtected &&
+                  !_protectionService.isAlarmActive)
                 SizedBox(
                   width: double.infinity,
                   height: 50,
@@ -344,7 +318,9 @@ class _SecurityScreenState extends State<SecurityScreen>
                     ),
                   ),
                 ),
-              if (isProtected && !isAlarmActive) const SizedBox(height: 12),
+              if (_protectionService.isProtected &&
+                  !_protectionService.isAlarmActive)
+                const SizedBox(height: 12),
               Container(
                 padding: const EdgeInsets.all(14),
                 decoration: BoxDecoration(

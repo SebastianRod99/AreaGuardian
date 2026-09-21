@@ -6,7 +6,6 @@ import 'package:areaguardian/screens/auth/login.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:areaguardian/screens/auth/pick_location_map.dart';
 import 'package:areaguardian/services/firestore_service.dart';
-import 'package:areaguardian/widgets/bar_nav.dart';
 import 'package:geocoding/geocoding.dart';
 
 // ==========================================
@@ -24,6 +23,10 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
   final _contactController = TextEditingController();
   final _puestoController = TextEditingController();
   final _addressController = TextEditingController();
+  final _nequiController = TextEditingController();
+  final _daviplataController = TextEditingController();
+  final _llaveController = TextEditingController();
+  final _catalogController = TextEditingController();
 
   // Coordenadas fijas del puesto guardadas
   double? _puestoLat;
@@ -33,7 +36,6 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
   bool _isLoading = false;
   bool _isSaved = false;
   bool _isVendorAccount = false;
-  bool _isVendorMode = false;
   String _vendorId = '';
   final FirestoreService _firestoreService = FirestoreService();
   final Geocoding _geocoding = Geocoding();
@@ -64,9 +66,20 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
       _puestoLng = puestoLng;
       _userEmail = prefs.getString('user_email') ?? 'usuario@areaguardian.com';
       _isVendorAccount = prefs.getString('vendor_id')?.isNotEmpty ?? false;
-      _isVendorMode = (prefs.getString('user_role') ?? '') == 'vendor';
       _vendorId = prefs.getString('vendor_id') ?? '';
     });
+    if (_vendorId.isNotEmpty) {
+      final vendor = await _firestoreService.getVendor(_vendorId);
+      if (!mounted || vendor == null) return;
+      setState(() {
+        _puestoController.text = vendor.shopName;
+        _addressController.text = vendor.address;
+        _nequiController.text = vendor.nequiNumber;
+        _daviplataController.text = vendor.daviplataNumber;
+        _llaveController.text = vendor.llaveNumber;
+        _catalogController.text = vendor.catalog.join('\n');
+      });
+    }
   }
 
   Future<String> _addressFromCoordinates(
@@ -97,28 +110,6 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     }
   }
 
-  Future<void> _toggleRoleMode(bool useVendorMode) async {
-    if (_vendorId.isEmpty) return;
-
-    setState(() => _isLoading = true);
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('user_role', useVendorMode ? 'vendor' : 'client');
-    await prefs.setBool('vendor_mode_enabled', useVendorMode);
-    if (!useVendorMode) {
-      await _firestoreService.setVendorActive(
-        vendorId: _vendorId,
-        isActive: false,
-      );
-    }
-
-    if (!mounted) return;
-    Navigator.pushAndRemoveUntil(
-      context,
-      MaterialPageRoute(builder: (_) => const AppShell(initialIndex: 0)),
-      (_) => false,
-    );
-  }
-
   Future<void> _saveChanges() async {
     if (_nameController.text.trim().isEmpty) {
       _showSnack('El nombre no puede estar vacío', isError: true);
@@ -131,9 +122,18 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     await prefs.setString('puesto_title', _puestoController.text.trim());
     await prefs.setString('vendor_address', _addressController.text.trim());
     if (_vendorId.isNotEmpty) {
-      await _firestoreService.updateVendorAddress(
+      await _firestoreService.updateVendorProfile(
         vendorId: _vendorId,
+        shopName: _puestoController.text.trim(),
         address: _addressController.text.trim(),
+        nequiNumber: _nequiController.text.trim(),
+        daviplataNumber: _daviplataController.text.trim(),
+        llaveNumber: _llaveController.text.trim(),
+        catalog: _catalogController.text
+            .split('\n')
+            .map((item) => item.trim())
+            .where((item) => item.isNotEmpty)
+            .toList(),
       );
     }
 
@@ -292,6 +292,10 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     _contactController.dispose();
     _puestoController.dispose();
     _addressController.dispose();
+    _nequiController.dispose();
+    _daviplataController.dispose();
+    _llaveController.dispose();
+    _catalogController.dispose();
     super.dispose();
   }
 
@@ -325,11 +329,6 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
                     const SizedBox(height: 12),
                     _buildContactFieldWithPicker(),
 
-                    if (_isVendorAccount) ...[
-                      const SizedBox(height: 24),
-                      _buildRoleModeCard(),
-                    ],
-
                     const SizedBox(height: 24),
                     _buildSectionTitle('Información del puesto'),
                     const SizedBox(height: 12),
@@ -343,6 +342,40 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
                     // ==========================================
                     _buildAutomaticAddress(),
+
+                    if (_isVendorAccount) ...[
+                      const SizedBox(height: 24),
+                      _buildSectionTitle('Pagos y catálogo'),
+                      const SizedBox(height: 12),
+                      _buildField(
+                        controller: _nequiController,
+                        label: 'Nequi',
+                        icon: Icons.account_balance_wallet_outlined,
+                        hint: 'Número o enlace de pago',
+                      ),
+                      const SizedBox(height: 12),
+                      _buildField(
+                        controller: _daviplataController,
+                        label: 'Daviplata',
+                        icon: Icons.payments_outlined,
+                        hint: 'Número o enlace de pago',
+                      ),
+                      const SizedBox(height: 12),
+                      _buildField(
+                        controller: _llaveController,
+                        label: 'Llave',
+                        icon: Icons.key_outlined,
+                        hint: 'Número, celular o enlace de Llave',
+                      ),
+                      const SizedBox(height: 12),
+                      _buildField(
+                        controller: _catalogController,
+                        label: 'Catálogo / menú',
+                        icon: Icons.menu_book_outlined,
+                        hint: 'Un producto por línea',
+                        maxLines: 5,
+                      ),
+                    ],
 
                     const SizedBox(height: 28),
                     _buildSaveButton(),
@@ -479,59 +512,12 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     );
   }
 
-  Widget _buildRoleModeCard() {
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: const Color(0xFF1D2030),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: const Color(0xFF00E6A7).withOpacity(0.25)),
-      ),
-      child: Row(
-        children: [
-          Icon(
-            _isVendorMode ? Icons.storefront : Icons.person_outline,
-            color: const Color(0xFF00E6A7),
-          ),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  _isVendorMode
-                      ? 'Modo dueño: ${_puestoController.text}'
-                      : 'Modo cliente',
-                  style: const TextStyle(
-                    color: Colors.white,
-                    fontWeight: FontWeight.bold,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(
-                  _isVendorMode
-                      ? 'Tu puesto puede aparecer activo cuando estés allí.'
-                      : 'Puedes recorrer la red sin activar tu puesto.',
-                  style: const TextStyle(color: Colors.white54, fontSize: 12),
-                ),
-              ],
-            ),
-          ),
-          Switch(
-            value: _isVendorMode,
-            onChanged: _isLoading ? null : _toggleRoleMode,
-            activeColor: const Color(0xFF00E6A7),
-          ),
-        ],
-      ),
-    );
-  }
-
   Widget _buildField({
     required TextEditingController controller,
     required String label,
     required IconData icon,
     required String hint,
+    int maxLines = 1,
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -543,6 +529,7 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
         const SizedBox(height: 6),
         TextField(
           controller: controller,
+          maxLines: maxLines,
           style: const TextStyle(color: Colors.white, fontSize: 14),
           onChanged: (_) => setState(() {}),
           decoration: InputDecoration(

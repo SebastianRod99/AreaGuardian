@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'package:sensors_plus/sensors_plus.dart';
 
 import 'dart:async';
 
@@ -14,6 +13,7 @@ import 'emergency.dart';
 import 'package:vibration/vibration.dart';
 import 'package:areaguardian/services/firestore_service.dart';
 import 'package:areaguardian/services/location_service.dart';
+import 'package:areaguardian/services/protection_service.dart';
 
 // ==========================================
 // PANTALLA PRINCIPAL — HOME
@@ -32,11 +32,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   String _userEmail = '';
 
   // ── Estado de seguridad ───────────────────────────────────────────────────
-  bool isProtected = false;
-  bool isAlarmActive = false;
+  final ProtectionService _protectionService = ProtectionService.shared;
   String emergencyContact = 'Sin contacto de emergencia';
-  int shakeCount = 0;
-  DateTime? lastShakeTime;
   DateTime? _lastAlertTime;
   String? _activeEmergencyId;
 
@@ -54,7 +51,6 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   bool _showVendorActivationPrompt = false;
 
   // ── Sensores y audio ──────────────────────────────────────────────────────
-  StreamSubscription? _accelerometerSubscription;
   late AudioPlayer _audioPlayer;
 
   // ── Animación del escudo ──────────────────────────────────────────────────
@@ -68,6 +64,12 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
     _initAudio();
     _loadPreferences();
     _setupPulseAnimation();
+    _protectionService.addListener(_onProtectionChanged);
+    _protectionService.onEmergencyTriggered = _triggerAlarm;
+  }
+
+  void _onProtectionChanged() {
+    if (mounted) setState(() {});
   }
 
   void _setupPulseAnimation() {
@@ -141,20 +143,31 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   }
 
   Future<void> _activateVendor() async {
-    if (!_isNearVendorPost || _vendorId.isEmpty) return;
+    if (_vendorId.isEmpty || (!_isVendorActive && !_isNearVendorPost)) {
+      if (mounted && !_isVendorActive) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Acércate a tu puesto para activarlo.')),
+        );
+      }
+      return;
+    }
     try {
       await _firestoreService.setVendorActive(
         vendorId: _vendorId,
-        isActive: true,
+        isActive: !_isVendorActive,
       );
       if (!mounted) return;
       setState(() {
-        _isVendorActive = true;
-        _showVendorActivationPrompt = false;
+        _isVendorActive = !_isVendorActive;
+        _showVendorActivationPrompt = _isNearVendorPost && !_isVendorActive;
       });
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Tu puesto ahora está activo para la comunidad.'),
+        SnackBar(
+          content: Text(
+            _isVendorActive
+                ? 'Tu puesto ahora está activo para la comunidad.'
+                : 'Tu puesto quedó desconectado de la red.',
+          ),
         ),
       );
     } catch (e) {
@@ -167,7 +180,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
 
   // ── Guardia ───────────────────────────────────────────────────────────────
   void _toggleGuardia() {
-    if (isProtected) {
+    if (_protectionService.isProtected) {
       _deactivateGuard();
     } else {
       _activateGuard();
@@ -175,38 +188,11 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   }
 
   void _activateGuard() {
-    setState(() {
-      isProtected = true;
-      shakeCount = 0;
-    });
-    _accelerometerSubscription = accelerometerEvents.listen((event) {
-      if (!isProtected || isAlarmActive) return;
-      double gForce =
-          (event.x * event.x + event.y * event.y + event.z * event.z) /
-          (9.8 * 9.8);
-      if (gForce > 3.0) {
-        final now = DateTime.now();
-        if (_lastAlertTime != null &&
-            now.difference(_lastAlertTime!) < const Duration(seconds: 5)) {
-          return;
-        }
-        if (lastShakeTime == null ||
-            now.difference(lastShakeTime!) >
-                const Duration(milliseconds: 500)) {
-          lastShakeTime = now;
-          setState(() => shakeCount++);
-          if (shakeCount >= 4) _triggerAlarm();
-        }
-      }
-    });
+    _protectionService.activate();
   }
 
   void _deactivateGuard() {
-    _accelerometerSubscription?.cancel();
-    setState(() {
-      isProtected = false;
-      shakeCount = 0;
-    });
+    _protectionService.deactivate();
   }
 
   void _triggerAlarm() async {
@@ -236,15 +222,13 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
       longitude: position.longitude,
     );
     _activeEmergencyId = emergency.id;
+    _protectionService.setActiveEmergencyId(emergency.id);
     _lastAlertTime = DateTime.now();
 
     if (await Vibration.hasVibrator() ?? false) {
       await Vibration.vibrate(pattern: [0, 100, 100, 100, 100, 100]);
     }
-    setState(() {
-      isAlarmActive = true;
-      shakeCount = 0;
-    });
+    _protectionService.markAlarmActive();
     await EmergencyAlertService.sendSMSAlert(context);
     await _audioPlayer.seek(Duration.zero);
     await _audioPlayer.play();
@@ -252,14 +236,13 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
 
   void _cancelAlarm() async {
     await _audioPlayer.stop();
-    if (_activeEmergencyId != null) {
-      await FirestoreService().resolveEmergency(_activeEmergencyId!);
+    final emergencyId = _protectionService.activeEmergencyId;
+    if (emergencyId != null) {
+      await FirestoreService().resolveEmergency(emergencyId);
+      _protectionService.clearActiveEmergencyId();
       _activeEmergencyId = null;
     }
-    setState(() {
-      isAlarmActive = false;
-      shakeCount = 0;
-    });
+    _protectionService.clearAlarm();
   }
 
   Future<void> _handleLogout() async {
@@ -274,7 +257,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
 
   @override
   void dispose() {
-    _accelerometerSubscription?.cancel();
+    _protectionService.removeListener(_onProtectionChanged);
     _vendorProximityTimer?.cancel();
     _audioPlayer.dispose();
     _pulseController.dispose();
@@ -284,7 +267,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
   // ── BUILD ─────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
-    if (isAlarmActive) {
+    if (_protectionService.isAlarmActive) {
       return _buildEmergencyScreen();
     }
     return Scaffold(
@@ -353,21 +336,23 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               ),
             ],
           ),
-          if (_showVendorActivationPrompt) ...[
-            const SizedBox(height: 12),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton.icon(
-                onPressed: _activateVendor,
-                icon: const Icon(Icons.power_settings_new),
-                label: const Text('Activar mi puesto'),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF00E6A7),
-                  foregroundColor: Colors.black,
-                ),
+          const SizedBox(height: 12),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton.icon(
+              onPressed: _activateVendor,
+              icon: const Icon(Icons.power_settings_new),
+              label: Text(
+                _isVendorActive ? 'Desactivar mi puesto' : 'Activar mi puesto',
+              ),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: _isVendorActive
+                    ? Colors.white10
+                    : const Color(0xFF00E6A7),
+                foregroundColor: _isVendorActive ? Colors.white : Colors.black,
               ),
             ),
-          ],
+          ),
         ],
       ),
     );
@@ -453,7 +438,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
         color: const Color(0xFF1D2030),
         borderRadius: BorderRadius.circular(20),
         border: Border.all(
-          color: isProtected
+          color: _protectionService.isProtected
               ? const Color(0xFF00E6A7).withOpacity(0.4)
               : Colors.white12,
           width: 1.5,
@@ -468,40 +453,48 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
               height: 110,
               decoration: BoxDecoration(
                 shape: BoxShape.circle,
-                color: isProtected
+                color: _protectionService.isProtected
                     ? const Color(0xFF00E6A7).withOpacity(0.1)
                     : Colors.white.withOpacity(0.04),
                 border: Border.all(
-                  color: isProtected ? const Color(0xFF00E6A7) : Colors.white24,
+                  color: _protectionService.isProtected
+                      ? const Color(0xFF00E6A7)
+                      : Colors.white24,
                   width: 2.5,
                 ),
               ),
               child: Icon(
-                isProtected ? Icons.security : Icons.security_outlined,
+                _protectionService.isProtected
+                    ? Icons.security
+                    : Icons.security_outlined,
                 size: 48,
-                color: isProtected ? const Color(0xFF00E6A7) : Colors.white38,
+                color: _protectionService.isProtected
+                    ? const Color(0xFF00E6A7)
+                    : Colors.white38,
               ),
             ),
           ),
           const SizedBox(height: 16),
           Text(
-            isProtected ? 'PROTEGIDO' : 'INACTIVO',
+            _protectionService.isProtected ? 'PROTEGIDO' : 'INACTIVO',
             style: TextStyle(
               fontSize: 18,
               fontWeight: FontWeight.bold,
               letterSpacing: 2,
-              color: isProtected ? const Color(0xFF00E6A7) : Colors.white38,
+              color: _protectionService.isProtected
+                  ? const Color(0xFF00E6A7)
+                  : Colors.white38,
             ),
           ),
           const SizedBox(height: 4),
           Text(
-            isProtected
+            _protectionService.isProtected
                 ? 'Agita 4 veces para activar la alarma'
                 : 'Activa la guardia para comenzar',
             style: const TextStyle(color: Colors.white54, fontSize: 12),
           ),
           const SizedBox(height: 14),
-          if (isProtected)
+          if (_protectionService.isProtected)
             Row(
               mainAxisAlignment: MainAxisAlignment.center,
               children: List.generate(
@@ -512,34 +505,40 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                   height: 12,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    color: i < shakeCount
+                    color: i < _protectionService.shakeCount
                         ? const Color(0xFF00E6A7)
                         : Colors.white12,
                   ),
                 ),
               ),
             ),
-          if (isProtected) const SizedBox(height: 14),
+          if (_protectionService.isProtected) const SizedBox(height: 14),
           SizedBox(
             width: double.infinity,
             height: 46,
             child: ElevatedButton(
               style: ElevatedButton.styleFrom(
-                backgroundColor: isProtected
+                backgroundColor: _protectionService.isProtected
                     ? Colors.white10
                     : const Color(0xFF00E6A7),
-                foregroundColor: isProtected ? Colors.white70 : Colors.black,
+                foregroundColor: _protectionService.isProtected
+                    ? Colors.white70
+                    : Colors.black,
                 elevation: 0,
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(12),
                   side: BorderSide(
-                    color: isProtected ? Colors.white24 : Colors.transparent,
+                    color: _protectionService.isProtected
+                        ? Colors.white24
+                        : Colors.transparent,
                   ),
                 ),
               ),
               onPressed: _toggleGuardia,
               child: Text(
-                isProtected ? 'DESACTIVAR GUARDIA' : 'ACTIVAR GUARDIA',
+                _protectionService.isProtected
+                    ? 'DESACTIVAR GUARDIA'
+                    : 'ACTIVAR GUARDIA',
                 style: const TextStyle(
                   fontWeight: FontWeight.bold,
                   fontSize: 14,
@@ -549,7 +548,8 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
             ),
           ),
           const SizedBox(height: 12),
-          if (isProtected && !isAlarmActive)
+          if (_protectionService.isProtected &&
+              !_protectionService.isAlarmActive)
             SizedBox(
               width: double.infinity,
               height: 46,
@@ -566,7 +566,9 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
                 ),
               ),
             ),
-          if (isProtected && !isAlarmActive) const SizedBox(height: 12),
+          if (_protectionService.isProtected &&
+              !_protectionService.isAlarmActive)
+            const SizedBox(height: 12),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             decoration: BoxDecoration(

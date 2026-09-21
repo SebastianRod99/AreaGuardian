@@ -9,6 +9,7 @@ import '../models/user_model.dart';
 
 class FirestoreService {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
+  static const Duration emergencyVisibilityDuration = Duration(minutes: 20);
 
   Future<void> saveUserProfile(UserModel user) async {
     final authenticatedUser = FirebaseAuth.instance.currentUser;
@@ -50,6 +51,7 @@ class FirestoreService {
         'isActive': vendor.isActive,
         'nequiNumber': vendor.nequiNumber,
         'daviplataNumber': vendor.daviplataNumber,
+        'llaveNumber': vendor.llaveNumber,
         'catalog': vendor.catalog,
       }, SetOptions(merge: true));
     } catch (e) {
@@ -128,17 +130,54 @@ class FirestoreService {
     }, SetOptions(merge: true));
   }
 
+  Future<void> updateVendorProfile({
+    required String vendorId,
+    required String shopName,
+    required String address,
+    required String nequiNumber,
+    required String daviplataNumber,
+    required String llaveNumber,
+    required List<String> catalog,
+  }) async {
+    final authenticatedUser = FirebaseAuth.instance.currentUser;
+    if (authenticatedUser == null || authenticatedUser.uid != vendorId) {
+      throw StateError(
+        'Solo el propietario autenticado puede editar el puesto.',
+      );
+    }
+    final updates = <String, dynamic>{
+      'shopName': shopName,
+      'address': address,
+      'nequiNumber': nequiNumber,
+      'daviplataNumber': daviplataNumber,
+      'llaveNumber': llaveNumber,
+      'catalog': catalog,
+    };
+    await _db
+        .collection('vendors')
+        .doc(vendorId)
+        .set(updates, SetOptions(merge: true));
+    await _db.collection('public_vendors').doc(vendorId).set({
+      'shopName': shopName,
+      'address': address,
+      'catalog': catalog,
+    }, SetOptions(merge: true));
+  }
+
   Future<List<EmergencyModel>> fetchActiveEmergencies() async {
     try {
       final snapshot = await _db
           .collection('emergencies')
           .where('status', isEqualTo: 'active')
           .get();
-      return snapshot.docs.map((doc) {
-        final data = doc.data();
-        data['id'] = data['id'] ?? doc.id;
-        return EmergencyModel.fromJson(data);
-      }).toList();
+      return snapshot.docs
+          .map((doc) {
+            final data = doc.data();
+            data['id'] = data['id'] ?? doc.id;
+            return EmergencyModel.fromJson(data);
+          })
+          .where(_isVisibleEmergency)
+          .toList();
     } catch (e) {
       debugPrint('Error al consultar emergencias activas: $e');
       return [];
@@ -151,12 +190,20 @@ class FirestoreService {
         .where('status', isEqualTo: 'active')
         .snapshots()
         .map(
-          (snapshot) => snapshot.docs.map((doc) {
-            final data = doc.data();
-            data['id'] = data['id'] ?? doc.id;
-            return EmergencyModel.fromJson(data);
-          }).toList(),
+          (snapshot) => snapshot.docs
+              .map((doc) {
+                final data = doc.data();
+                data['id'] = data['id'] ?? doc.id;
+                return EmergencyModel.fromJson(data);
+              })
+              .where(_isVisibleEmergency)
+              .toList(),
         );
+  }
+
+  bool _isVisibleEmergency(EmergencyModel emergency) {
+    return DateTime.now().difference(emergency.timestamp) <
+        emergencyVisibilityDuration;
   }
 
   Future<void> resolveEmergency(String emergencyId) async {

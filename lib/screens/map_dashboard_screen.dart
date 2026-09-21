@@ -50,11 +50,13 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
 
   String _myPuestoTitle = 'Mi Puesto';
   String _myAddress = '';
+  String _vendorId = '';
 
   // Lista de puestos dinámicos obtenidos desde Firebase Firestore
   List<VendorModel> _puestosVecinos = [];
   List<EmergencyModel> _emergencies = [];
   StreamSubscription<List<EmergencyModel>>? _emergencySubscription;
+  Timer? _emergencyExpiryTimer;
   VendorModel? _selectedVendorPuesto;
   bool _isMyPuestoSelected = false;
 
@@ -62,6 +64,31 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   void initState() {
     super.initState();
     _loadMyPuestoAndLocation();
+    _emergencyExpiryTimer = Timer.periodic(
+      const Duration(seconds: 30),
+      (_) => _removeExpiredEmergencies(),
+    );
+  }
+
+  void _removeExpiredEmergencies() {
+    final cutoff = DateTime.now().subtract(
+      FirestoreService.emergencyVisibilityDuration,
+    );
+    if (!mounted) return;
+    setState(() {
+      _emergencies = _emergencies
+          .where((emergency) => emergency.timestamp.isAfter(cutoff))
+          .toList();
+    });
+  }
+
+  void _watchActiveEmergencies() {
+    _emergencySubscription?.cancel();
+    _emergencySubscription = _firestoreService.watchActiveEmergencies().listen((
+      emergencies,
+    ) {
+      if (mounted) setState(() => _emergencies = emergencies);
+    });
   }
 
   Future<void> _loadMyPuestoAndLocation() async {
@@ -69,6 +96,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
       _isVendorRole = (prefs.getString('user_role') ?? '') == 'vendor';
+      _vendorId = prefs.getString('vendor_id') ?? '';
       _myPuestoTitle = prefs.getString('puesto_title') ?? 'Mi Puesto';
       _myAddress = prefs.getString('vendor_address') ?? '';
     });
@@ -79,12 +107,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       setState(() {
         _locationDenied = true;
       });
-      _emergencySubscription?.cancel();
-      _emergencySubscription = _firestoreService
-          .watchActiveEmergencies()
-          .listen((emergencies) {
-            if (mounted) setState(() => _emergencies = emergencies);
-          });
+      _watchActiveEmergencies();
     }
 
     try {
@@ -116,8 +139,20 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       setState(() {
         _puestosVecinos = vendors;
         _emergencies = emergencies;
+        final myVendor = vendors
+            .where((vendor) => vendor.id == _vendorId)
+            .firstOrNull;
+        if (myVendor != null) {
+          _myPuestoTitle = myVendor.shopName.isNotEmpty
+              ? myVendor.shopName
+              : _myPuestoTitle;
+          _myAddress = myVendor.address.isNotEmpty
+              ? myVendor.address
+              : _myAddress;
+        }
         _isLoading = false;
       });
+      _watchActiveEmergencies();
 
       // HU-05: si llegamos desde una notificación de emergencia, centramos
       // el mapa ahí en cuanto el widget termine de construirse.
@@ -143,6 +178,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   @override
   void dispose() {
     _emergencySubscription?.cancel();
+    _emergencyExpiryTimer?.cancel();
     super.dispose();
   }
 
@@ -161,22 +197,23 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
 
   Future<void> _openDirections(VendorModel puesto) async {
     final destination = '${puesto.latitude},${puesto.longitude}';
-    final geoUri = Uri.parse(
-      'geo:${puesto.latitude},${puesto.longitude}?q=$destination',
-    );
-    final googleUri = Uri.parse(
-      'https://www.google.com/maps/dir/?api=1&destination=$destination',
-    );
+    final navigationUris = [
+      Uri.parse('comgooglemaps://?daddr=$destination&directionsmode=driving'),
+      Uri.parse('waze://?ll=$destination&navigate=yes'),
+      Uri.parse(
+        'https://www.google.com/maps/dir/?api=1&destination=$destination',
+      ),
+    ];
 
-    if (await canLaunchUrl(geoUri)) {
-      await launchUrl(geoUri, mode: LaunchMode.externalApplication);
-    } else if (await canLaunchUrl(googleUri)) {
-      await launchUrl(googleUri, mode: LaunchMode.externalApplication);
-    } else if (mounted) {
+    for (final uri in navigationUris) {
+      if (await canLaunchUrl(uri)) {
+        await launchUrl(uri, mode: LaunchMode.externalApplication);
+        return;
+      }
+    }
+    if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('No se encontró una aplicación de mapas.'),
-        ),
+        const SnackBar(content: Text('No se pudo abrir Google Maps ni Waze.')),
       );
     }
   }

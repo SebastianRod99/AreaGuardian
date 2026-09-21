@@ -14,6 +14,7 @@ class VendorModel {
 
   final String nequiNumber;
   final String daviplataNumber;
+  final String llaveNumber;
   final List<String> catalog;
   final bool isActive;
   final DateTime? lastSeen;
@@ -32,6 +33,7 @@ class VendorModel {
     required this.longitude,
     required this.nequiNumber,
     required this.daviplataNumber,
+    this.llaveNumber = '',
     this.catalog = const [],
     this.isActive = true,
     this.lastSeen,
@@ -50,6 +52,7 @@ class VendorModel {
       'longitude': longitude,
       'nequiNumber': nequiNumber,
       'daviplataNumber': daviplataNumber,
+      'llaveNumber': llaveNumber,
       'catalog': catalog,
       'isActive': isActive,
       'lastSeen': lastSeen?.toIso8601String(),
@@ -69,6 +72,7 @@ class VendorModel {
       longitude: (json['longitude'] as num?)?.toDouble() ?? 0.0,
       nequiNumber: json['nequiNumber'] ?? '',
       daviplataNumber: json['daviplataNumber'] ?? '',
+      llaveNumber: json['llaveNumber'] ?? '',
       catalog:
           (json['catalog'] as List<dynamic>?)
               ?.map((item) => item.toString())
@@ -98,6 +102,10 @@ class VendorModel {
     bool? isActive,
     DateTime? lastSeen,
     String? fcmToken,
+    String? nequiNumber,
+    String? daviplataNumber,
+    String? llaveNumber,
+    List<String>? catalog,
   }) {
     return VendorModel(
       id: id,
@@ -108,9 +116,10 @@ class VendorModel {
       category: category,
       latitude: latitude ?? this.latitude,
       longitude: longitude ?? this.longitude,
-      nequiNumber: nequiNumber,
-      daviplataNumber: daviplataNumber,
-      catalog: catalog,
+      nequiNumber: nequiNumber ?? this.nequiNumber,
+      daviplataNumber: daviplataNumber ?? this.daviplataNumber,
+      llaveNumber: llaveNumber ?? this.llaveNumber,
+      catalog: catalog ?? this.catalog,
       isActive: isActive ?? this.isActive,
       lastSeen: lastSeen ?? this.lastSeen,
       fcmToken: fcmToken ?? this.fcmToken,

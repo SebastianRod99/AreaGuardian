@@ -5,15 +5,19 @@ import 'package:flutter/foundation.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:vibration/vibration.dart';
 
-class ProtectionService {
+class ProtectionService extends ChangeNotifier {
   ProtectionService({this.onEmergencyTriggered, this.onConfirmationVibration});
 
-  StreamSubscription<AccelerometerEvent>? _accelerometerSubscription;
+  static final ProtectionService shared = ProtectionService();
 
+  StreamSubscription<AccelerometerEvent>? _accelerometerSubscription;
   int _shakeCount = 0;
   DateTime? _lastShakeTime;
   DateTime? _lastAlertTime;
   bool _isTriggered = false;
+  bool _isProtected = false;
+  bool _isAlarmActive = false;
+  String? _activeEmergencyId;
 
   static const int _requiredShakes = 4;
   static const double _shakeThreshold = 15.0;
@@ -24,24 +28,50 @@ class ProtectionService {
   Future<void> Function()? onConfirmationVibration;
 
   int get shakeCount => _shakeCount;
+  bool get isProtected => _isProtected;
+  bool get isAlarmActive => _isAlarmActive;
+  String? get activeEmergencyId => _activeEmergencyId;
 
-  void startListening() {
-    _accelerometerSubscription = accelerometerEvents.listen((
-      AccelerometerEvent event,
-    ) {
+  void setActiveEmergencyId(String id) {
+    _activeEmergencyId = id;
+  }
+
+  void clearActiveEmergencyId() {
+    _activeEmergencyId = null;
+  }
+
+  void activate() {
+    if (_isProtected) return;
+    _isProtected = true;
+    _shakeCount = 0;
+    _lastShakeTime = null;
+    _startListening();
+    notifyListeners();
+  }
+
+  void deactivate() {
+    _isProtected = false;
+    _shakeCount = 0;
+    _lastShakeTime = null;
+    _accelerometerSubscription?.cancel();
+    _accelerometerSubscription = null;
+    notifyListeners();
+  }
+
+  void _startListening() {
+    if (_accelerometerSubscription != null) return;
+    _accelerometerSubscription = accelerometerEvents.listen((event) {
       final acceleration = math.sqrt(
         event.x * event.x + event.y * event.y + event.z * event.z,
       );
-
-      if (acceleration > _shakeThreshold) {
-        handleShakeEvent(DateTime.now(), acceleration);
-      }
+      handleShakeEvent(DateTime.now(), acceleration);
     });
   }
 
   void handleShakeEvent(DateTime now, double acceleration) {
-    if (acceleration <= _shakeThreshold) return;
-
+    if (_isAlarmActive || acceleration <= _shakeThreshold) {
+      return;
+    }
     if (_lastAlertTime != null &&
         now.difference(_lastAlertTime!) < _alertDebounce) {
       return;
@@ -53,9 +83,9 @@ class ProtectionService {
     } else {
       _shakeCount++;
     }
-
     _lastShakeTime = now;
     debugPrint('Sacudida detectada: $_shakeCount/$_requiredShakes');
+    notifyListeners();
 
     if (_shakeCount >= _requiredShakes) {
       _lastAlertTime = now;
@@ -68,18 +98,29 @@ class ProtectionService {
     if (_isTriggered) return;
     _isTriggered = true;
     _shakeCount = 0;
+    notifyListeners();
 
     final emergencyResult = onEmergencyTriggered?.call();
     _isTriggered = false;
-    if (emergencyResult is Future) {
-      await emergencyResult;
-    }
+    if (emergencyResult is Future) await emergencyResult;
 
     if (onConfirmationVibration != null) {
       await onConfirmationVibration!();
     } else {
       await triggerConfirmationVibration();
     }
+  }
+
+  void markAlarmActive() {
+    _isAlarmActive = true;
+    _shakeCount = 0;
+    notifyListeners();
+  }
+
+  void clearAlarm() {
+    _isAlarmActive = false;
+    _shakeCount = 0;
+    notifyListeners();
   }
 
   Future<void> triggerConfirmationVibration() async {
@@ -96,5 +137,9 @@ class ProtectionService {
     _lastShakeTime = null;
     _lastAlertTime = null;
     _isTriggered = false;
+    _isProtected = false;
+    _isAlarmActive = false;
+    _activeEmergencyId = null;
+    notifyListeners();
   }
 }

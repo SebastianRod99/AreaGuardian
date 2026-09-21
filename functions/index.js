@@ -34,6 +34,7 @@ exports.syncPublicVendor = onDocumentWritten("vendors/{vendorId}", async (event)
     isActive: vendor.isActive === true,
     nequiNumber: vendor.nequiNumber || "",
     daviplataNumber: vendor.daviplataNumber || "",
+    llaveNumber: vendor.llaveNumber || "",
     catalog: Array.isArray(vendor.catalog) ? vendor.catalog : [],
   });
 });
