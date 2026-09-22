@@ -14,6 +14,7 @@ import 'package:vibration/vibration.dart';
 import 'package:areaguardian/services/firestore_service.dart';
 import 'package:areaguardian/services/location_service.dart';
 import 'package:areaguardian/services/protection_service.dart';
+import 'package:areaguardian/services/auth_service.dart';
 
 // ==========================================
 // PANTALLA PRINCIPAL — HOME
@@ -247,6 +248,7 @@ class _MainScreenState extends State<MainScreen> with TickerProviderStateMixin {
 
   Future<void> _handleLogout() async {
     final prefs = await SharedPreferences.getInstance();
+    await AuthService().signOut();
     await prefs.setBool('is_logged_in', false);
     setState(() {
       _isLoggedIn = false;
