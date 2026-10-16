@@ -1,12 +1,22 @@
+import 'dart:async';
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:areaguardian/services/auth_service.dart';
+import 'package:areaguardian/services/session_service.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'package:areaguardian/screens/auth/login.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:areaguardian/screens/auth/pick_location_map.dart';
 import 'package:areaguardian/services/firestore_service.dart';
 import 'package:geocoding/geocoding.dart';
+import 'package:areaguardian/models/vendor_model.dart';
+import 'package:areaguardian/widgets/profile_avatar.dart';
 
 // ==========================================
 // PANTALLA DE PERFIL / CUENTA
@@ -36,9 +46,14 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
   bool _isLoading = false;
   bool _isSaved = false;
   bool _isVendorAccount = false;
+  bool _isUploadingPhoto = false;
+  bool _isDeletingAccount = false;
+  double _photoUploadProgress = 0;
   String _vendorId = '';
+  StreamSubscription<VendorModel?>? _vendorSubscription;
   final FirestoreService _firestoreService = FirestoreService();
   final Geocoding _geocoding = Geocoding();
+  final ImagePicker _imagePicker = ImagePicker();
 
   @override
   void initState() {
@@ -64,12 +79,21 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
       _addressController.text = address;
       _puestoLat = puestoLat;
       _puestoLng = puestoLng;
-      _userEmail = prefs.getString('user_email') ?? 'usuario@areaguardian.com';
+      _userEmail =
+          FirebaseAuth.instance.currentUser?.email ??
+          'usuario@areaguardian.com';
       _isVendorAccount = prefs.getString('vendor_id')?.isNotEmpty ?? false;
       _vendorId = prefs.getString('vendor_id') ?? '';
     });
-    if (_vendorId.isNotEmpty) {
-      final vendor = await _firestoreService.getVendor(_vendorId);
+    _watchVendorProfile();
+  }
+
+  void _watchVendorProfile() {
+    if (_vendorId.isEmpty) return;
+    _vendorSubscription?.cancel();
+    _vendorSubscription = _firestoreService.watchVendor(_vendorId).listen((
+      vendor,
+    ) {
       if (!mounted || vendor == null) return;
       setState(() {
         _puestoController.text = vendor.shopName;
@@ -79,7 +103,7 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
         _llaveController.text = vendor.llaveNumber;
         _catalogController.text = vendor.catalog.join('\n');
       });
-    }
+    });
   }
 
   Future<String> _addressFromCoordinates(
@@ -121,6 +145,13 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
     await prefs.setString('contact', _contactController.text.trim());
     await prefs.setString('puesto_title', _puestoController.text.trim());
     await prefs.setString('vendor_address', _addressController.text.trim());
+    var emergencyContactSynced = true;
+    try {
+      await _firestoreService.updateEmergencyContact(_contactController.text);
+    } catch (error) {
+      emergencyContactSynced = false;
+      debugPrint('No se pudo sincronizar el contacto de emergencia: $error');
+    }
     if (_vendorId.isNotEmpty) {
       await _firestoreService.updateVendorProfile(
         vendorId: _vendorId,
@@ -157,9 +188,84 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
       _isLoading = false;
       _isSaved = true;
     });
-    _showSnack('Cambios guardados correctamente');
+    _showSnack(
+      emergencyContactSynced
+          ? 'Cambios guardados correctamente'
+          : 'Perfil guardado, pero no se sincronizó el contacto de emergencia.',
+      isError: !emergencyContactSynced,
+    );
     await Future.delayed(const Duration(seconds: 2));
     if (mounted) setState(() => _isSaved = false);
+  }
+
+  Future<void> _changeProfilePhoto(ImageSource source) async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      _showSnack('Inicia sesión para cambiar tu foto.', isError: true);
+      return;
+    }
+
+    try {
+      final image = await _imagePicker.pickImage(
+        source: source,
+        imageQuality: 85,
+        maxWidth: 1024,
+        maxHeight: 1024,
+      );
+      if (image == null) return;
+
+      final imageBytes = await image.readAsBytes();
+      if (imageBytes.lengthInBytes >= 5 * 1024 * 1024) {
+        _showSnack('La foto debe pesar menos de 5 MB.', isError: true);
+        return;
+      }
+
+      setState(() {
+        _isUploadingPhoto = true;
+        _photoUploadProgress = 0;
+      });
+
+      final storageReference = FirebaseStorage.instance.ref().child(
+        'profile_photos/${user.uid}/profile.jpg',
+      );
+      final uploadTask = storageReference.putData(
+        imageBytes,
+        SettableMetadata(contentType: 'image/jpeg'),
+      );
+      await for (final snapshot in uploadTask.snapshotEvents) {
+        if (mounted) {
+          setState(() {
+            _photoUploadProgress = snapshot.totalBytes == 0
+                ? 0
+                : snapshot.bytesTransferred / snapshot.totalBytes;
+          });
+        }
+      }
+
+      final photoUrl = await storageReference.getDownloadURL();
+      await FirebaseFirestore.instance.collection('users').doc(user.uid).update(
+        {'profilePhotoUrl': photoUrl},
+      );
+      if (mounted) _showSnack('Foto de perfil actualizada.');
+    } on FirebaseException catch (error) {
+      if (mounted) {
+        _showSnack(
+          'No se pudo subir la foto: ${error.message ?? error.code}',
+          isError: true,
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        _showSnack('No se pudo actualizar la foto: $error', isError: true);
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isUploadingPhoto = false;
+          _photoUploadProgress = 0;
+        });
+      }
+    }
   }
 
   // ==========================================
@@ -262,9 +368,8 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
     if (confirm != true) return;
 
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setBool('is_logged_in', false);
     await AuthService().signOut();
+    await SessionService().clearLocalSession();
 
     if (!mounted) return;
     Navigator.pushAndRemoveUntil(
@@ -272,6 +377,75 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
       MaterialPageRoute(builder: (_) => const LoginScreen()),
       (route) => false,
     );
+  }
+
+  Future<void> _deleteAccount() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: const Color(0xFF1D2030),
+        title: const Text('Eliminar mi cuenta y mis datos'),
+        content: const Text(
+          'Se eliminarán tu perfil, puesto, emergencias y foto, además de tu '
+          'cuenta de acceso. Esta acción no se puede deshacer.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancelar'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+            child: const Text('Eliminar cuenta'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _isDeletingAccount = true);
+
+    try {
+      await FirebaseFunctions.instanceFor(region: 'southamerica-east1')
+          .httpsCallable(
+            'deleteAccountAndData',
+            options: HttpsCallableOptions(
+              timeout: const Duration(minutes: 5),
+            ),
+          )
+          .call();
+      await SessionService().clearLocalSession();
+      try {
+        await AuthService().signOut();
+      } catch (error) {
+        debugPrint('La cuenta se eliminó, pero la sesión local no cerró: $error');
+      }
+      if (!mounted) return;
+      Navigator.pushAndRemoveUntil(
+        context,
+        MaterialPageRoute(builder: (_) => const LoginScreen()),
+        (route) => false,
+      );
+    } on FirebaseFunctionsException catch (error) {
+      debugPrint('No se pudo eliminar la cuenta: ${error.code}');
+      if (mounted) {
+        _showSnack(
+          error.message ??
+              'No se pudo eliminar la cuenta. Intenta de nuevo más tarde.',
+          isError: true,
+        );
+      }
+    } catch (error) {
+      debugPrint('No se pudo completar la eliminación de la cuenta: $error');
+      if (mounted) {
+        _showSnack(
+          'No se pudo eliminar la cuenta. Intenta de nuevo más tarde.',
+          isError: true,
+        );
+      }
+    } finally {
+      if (mounted) setState(() => _isDeletingAccount = false);
+    }
   }
 
   void _showSnack(String message, {bool isError = false}) {
@@ -288,6 +462,7 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
   @override
   void dispose() {
+    _vendorSubscription?.cancel();
     _nameController.dispose();
     _contactController.dispose();
     _puestoController.dispose();
@@ -384,6 +559,8 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
                     const SizedBox(height: 24),
                     _buildLogoutButton(),
                     const SizedBox(height: 16),
+                    _buildDeleteAccountButton(),
+                    const SizedBox(height: 24),
                     _buildVersionInfo(),
                   ],
                 ),
@@ -438,34 +615,10 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
 
   // ── AVATAR ────────────────────────────────────────────────────────────────
   Widget _buildAvatar() {
-    final initial = _nameController.text.isNotEmpty
-        ? _nameController.text[0].toUpperCase()
-        : 'U';
     return Center(
       child: Column(
         children: [
-          Container(
-            width: 80,
-            height: 80,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: const Color(0xFF00E6A7).withOpacity(0.12),
-              border: Border.all(
-                color: const Color(0xFF00E6A7).withOpacity(0.3),
-                width: 2,
-              ),
-            ),
-            child: Center(
-              child: Text(
-                initial,
-                style: const TextStyle(
-                  color: Color(0xFF00E6A7),
-                  fontSize: 32,
-                  fontWeight: FontWeight.bold,
-                ),
-              ),
-            ),
-          ),
+          const ProfileAvatar(size: 80),
           const SizedBox(height: 10),
           Text(
             _nameController.text.isNotEmpty
@@ -482,6 +635,44 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
             _userEmail,
             style: const TextStyle(color: Colors.white38, fontSize: 12),
           ),
+          const SizedBox(height: 12),
+          Wrap(
+            alignment: WrapAlignment.center,
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              OutlinedButton.icon(
+                onPressed: _isUploadingPhoto
+                    ? null
+                    : () => _changeProfilePhoto(ImageSource.gallery),
+                icon: const Icon(Icons.photo_library_outlined, size: 18),
+                label: const Text('Galería'),
+              ),
+              OutlinedButton.icon(
+                onPressed: _isUploadingPhoto
+                    ? null
+                    : () => _changeProfilePhoto(ImageSource.camera),
+                icon: const Icon(Icons.photo_camera_outlined, size: 18),
+                label: const Text('Cámara'),
+              ),
+            ],
+          ),
+          if (_isUploadingPhoto) ...[
+            const SizedBox(height: 8),
+            SizedBox(
+              width: 220,
+              child: LinearProgressIndicator(
+                value: _photoUploadProgress,
+                color: const Color(0xFF00E6A7),
+                backgroundColor: Colors.white12,
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'Subiendo foto ${(100 * _photoUploadProgress).round()}%',
+              style: const TextStyle(color: Colors.white54, fontSize: 12),
+            ),
+          ],
         ],
       ),
     );
@@ -785,6 +976,31 @@ class _AccountConfigScreenState extends State<AccountConfigScreen> {
           style: TextStyle(
             color: Colors.redAccent,
             fontWeight: FontWeight.bold,
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildDeleteAccountButton() {
+    return SizedBox(
+      width: double.infinity,
+      height: 50,
+      child: OutlinedButton.icon(
+        onPressed: _isDeletingAccount ? null : _deleteAccount,
+        icon: _isDeletingAccount
+            ? const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            : const Icon(Icons.delete_forever_outlined),
+        label: const Text('Eliminar mi cuenta y mis datos'),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: Colors.redAccent,
+          side: const BorderSide(color: Colors.redAccent),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(14),
           ),
         ),
       ),

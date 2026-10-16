@@ -1,35 +1,215 @@
 rules_version = '2';
 
+// Assumed data model:
+// users/{uid}: private profile; id/name/email/phone/isVendor are required,
+//   owner-editable profile/contact/location fields; role and vendorId are fixed.
+// vendors/{uid}: owner profile and active-post state, coordinates, catalog
+//   (up to 50 strings), payment handles, current location and FCM token.
+// public_vendors/{uid}: Cloud Functions projection; signed-in read-only data.
+// emergencies/{id}: owner-created active alert with identity, role, coordinates,
+//   timestamp and isTest. SMS, FCM recipients and delivery states are server-only.
 service cloud.firestore {
   match /databases/{database}/documents {
-    function signedIn() {
+    function isAuthenticated() {
       return request.auth != null;
     }
 
+    function signedIn() {
+      return isAuthenticated();
+    }
+
     function isSelf(userId) {
-      return signedIn() && request.auth.uid == userId;
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function uidUnchanged() {
+      return request.resource.data.id == request.auth.uid;
+    }
+
+    function uidNotModified() {
+      return request.resource.data.id == resource.data.id;
+    }
+
+    function isValidUserProfile(userId) {
+      let data = request.resource.data;
+      return data.keys().hasOnly([
+          'id', 'name', 'email', 'phone', 'isVendor', 'vendorId',
+          'latitude', 'longitude', 'lastSeen', 'emergencyContact',
+          'activeEmergencyId', 'fcmToken', 'lastLoginAt', 'appVersion',
+          'profilePhotoUrl', 'lastKnownLatitude', 'lastKnownLongitude',
+          'lastKnownLocationAt', 'consentVersion', 'consentAcceptedAt',
+          'analyticsConsent'
+        ])
+        && data.id == userId
+        && data.name is string && data.name.size() <= 120
+        && data.email is string && data.email.size() <= 254
+        && data.phone is string && data.phone.size() <= 32
+        && data.isVendor is bool
+        && (data.get('vendorId', null) == null ||
+          (data.vendorId is string && data.vendorId.size() <= 128))
+        && (data.get('latitude', null) == null || data.latitude is number)
+        && (data.get('longitude', null) == null || data.longitude is number)
+        && (data.get('lastSeen', null) == null ||
+          (data.lastSeen is string && data.lastSeen.size() <= 40))
+        && (data.get('emergencyContact', null) == null ||
+          (data.emergencyContact is string && data.emergencyContact.size() <= 160))
+        && (data.get('activeEmergencyId', null) == null ||
+          (data.activeEmergencyId is string && data.activeEmergencyId.size() <= 128))
+        && (data.get('fcmToken', null) == null ||
+          (data.fcmToken is string && data.fcmToken.size() <= 4096))
+        && (data.get('lastLoginAt', null) == null ||
+          data.lastLoginAt is timestamp)
+        && (data.get('appVersion', null) == null ||
+          (data.appVersion is string && data.appVersion.size() <= 32))
+        && (data.get('profilePhotoUrl', null) == null ||
+          (data.profilePhotoUrl is string && data.profilePhotoUrl.size() <= 2048))
+        && (data.get('lastKnownLatitude', null) == null ||
+          (data.lastKnownLatitude is number && data.lastKnownLatitude >= -90
+            && data.lastKnownLatitude <= 90))
+        && (data.get('lastKnownLongitude', null) == null ||
+          (data.lastKnownLongitude is number && data.lastKnownLongitude >= -180
+            && data.lastKnownLongitude <= 180))
+        && (data.get('lastKnownLocationAt', null) == null ||
+          data.lastKnownLocationAt is timestamp)
+        && (data.get('consentVersion', null) == null ||
+          (data.consentVersion is string && data.consentVersion.size() <= 32))
+        && (data.get('consentAcceptedAt', null) == null ||
+          data.consentAcceptedAt is timestamp)
+        && (data.get('analyticsConsent', null) == null ||
+          data.analyticsConsent is bool);
+    }
+
+    function isValidVendor(vendorId) {
+      let data = request.resource.data;
+      return data.keys().hasOnly([
+          'id', 'userId', 'shopName', 'address', 'vendorName', 'category',
+          'latitude', 'longitude', 'currentLatitude', 'currentLongitude',
+          'lastLocationUpdate', 'nequiNumber', 'daviplataNumber',
+          'llaveNumber', 'catalog', 'isActive', 'lastSeen', 'fcmToken'
+        ])
+        && data.id == vendorId
+        && data.userId == request.auth.uid
+        && data.shopName is string && data.shopName.size() > 0
+        && data.shopName.size() <= 120
+        && data.address is string && data.address.size() <= 300
+        && data.vendorName is string && data.vendorName.size() <= 120
+        && data.category is string && data.category.size() <= 80
+        && data.latitude is number && data.latitude >= -90
+        && data.latitude <= 90
+        && data.longitude is number && data.longitude >= -180
+        && data.longitude <= 180
+        && data.nequiNumber is string && data.nequiNumber.size() <= 80
+        && data.daviplataNumber is string && data.daviplataNumber.size() <= 80
+        && data.llaveNumber is string && data.llaveNumber.size() <= 80
+        && data.catalog is list && data.catalog.size() <= 50
+        && data.isActive is bool
+        && (data.get('currentLatitude', null) == null ||
+          (data.currentLatitude is number && data.currentLatitude >= -90
+            && data.currentLatitude <= 90))
+        && (data.get('currentLongitude', null) == null ||
+          (data.currentLongitude is number && data.currentLongitude >= -180
+            && data.currentLongitude <= 180))
+        && (data.get('lastLocationUpdate', null) == null ||
+          data.lastLocationUpdate is timestamp)
+        && (data.get('lastSeen', null) == null || data.lastSeen is timestamp)
+        && (data.get('fcmToken', null) == null ||
+          (data.fcmToken is string && data.fcmToken.size() <= 4096));
+    }
+
+    function emergencyPointerUpdateIsValid(userId) {
+      let previousId = resource.data.get('activeEmergencyId', null);
+      let nextId = request.resource.data.get('activeEmergencyId', null);
+      return previousId == nextId
+        || (nextId is string
+          && getAfter(/databases/$(database)/documents/emergencies/$(nextId)).data.userId == userId
+          && getAfter(/databases/$(database)/documents/emergencies/$(nextId)).data.status == 'active'
+          && activeEmergencyPointerCanBeReleased(userId, previousId))
+        || (nextId == null
+          && activeEmergencyPointerCanBeReleased(userId, previousId));
+    }
+
+    function activeEmergencyPointerCanBeReleased(userId, emergencyId) {
+      return emergencyId == null
+        || !exists(/databases/$(database)/documents/emergencies/$(emergencyId))
+        || getAfter(/databases/$(database)/documents/emergencies/$(emergencyId)).data.userId != userId
+        || getAfter(/databases/$(database)/documents/emergencies/$(emergencyId)).data.status in ['resolved', 'cancelled', 'false_alarm'];
+    }
+
+    function emergencyLockIsValid(userId, emergencyId) {
+      let userPath = /databases/$(database)/documents/users/$(userId);
+      let previousId = get(userPath).data.get('activeEmergencyId', null);
+      return getAfter(userPath).data.get('activeEmergencyId', null) == emergencyId
+        && activeEmergencyPointerCanBeReleased(userId, previousId);
+    }
+
+    function isValidEmergency(emergencyId) {
+      return request.resource.data.keys().hasOnly([
+          'id', 'userId', 'userName', 'role', 'shopName', 'latitude',
+          'longitude', 'timestamp', 'status', 'isTest'
+        ])
+        && request.resource.data.id == emergencyId
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.userName is string
+        && request.resource.data.userName.size() > 0
+        && request.resource.data.userName.size() <= 120
+        && request.resource.data.role in ['vendor', 'client']
+        && request.resource.data.shopName is string
+        && request.resource.data.shopName.size() > 0
+        && request.resource.data.shopName.size() <= 120
+        && request.resource.data.latitude is number
+        && request.resource.data.latitude >= -90
+        && request.resource.data.latitude <= 90
+        && request.resource.data.longitude is number
+        && request.resource.data.longitude >= -180
+        && request.resource.data.longitude <= 180
+        && request.resource.data.timestamp == request.time
+        && request.resource.data.status == 'active'
+        && request.resource.data.isTest is bool
+        && emergencyLockIsValid(request.auth.uid, emergencyId)
+        && request.resource.data.role ==
+          (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.isVendor
+            ? 'vendor'
+            : 'client')
+        && (request.resource.data.role == 'client'
+          ? request.resource.data.shopName == 'Vecino'
+          : request.resource.data.shopName ==
+              get(/databases/$(database)/documents/vendors/$(request.auth.uid)).data.shopName);
     }
 
     match /users/{userId} {
       allow read: if isSelf(userId);
       allow create: if isSelf(userId)
-        && request.resource.data.id == userId
+        && uidUnchanged()
+        && isValidUserProfile(userId)
+        && request.resource.data.get('activeEmergencyId', null) == null
         && (!request.resource.data.isVendor
           || request.resource.data.vendorId == userId);
       allow update: if isSelf(userId)
+        && uidNotModified()
+        && isValidUserProfile(userId)
         && request.resource.data.id == resource.data.id
-        && request.resource.data.vendorId == resource.data.vendorId;
-      allow delete: if isSelf(userId);
+        && request.resource.data.get('vendorId', null) ==
+          resource.data.get('vendorId', null)
+        && request.resource.data.isVendor == resource.data.isVendor
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'phone', 'emergencyContact', 'lastSeen', 'activeEmergencyId',
+          'fcmToken', 'lastLoginAt', 'appVersion', 'profilePhotoUrl',
+          'latitude', 'longitude', 'lastKnownLatitude', 'lastKnownLongitude',
+          'lastKnownLocationAt', 'consentVersion', 'consentAcceptedAt',
+          'analyticsConsent'
+        ])
+        && emergencyPointerUpdateIsValid(userId);
+      allow delete: if false;
     }
 
     match /vendors/{vendorId} {
       allow read: if isSelf(vendorId);
       allow create: if isSelf(vendorId)
-        && request.resource.data.id == vendorId
-        && request.resource.data.userId == request.auth.uid
+        && isValidVendor(vendorId)
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.vendorId == vendorId;
       allow update: if isSelf(vendorId)
         && resource.data.userId == request.auth.uid
+        && isValidVendor(vendorId)
         && request.resource.data.userId == resource.data.userId
         && request.resource.data.id == resource.data.id;
       allow delete: if isSelf(vendorId) && resource.data.userId == request.auth.uid;
@@ -37,15 +217,84 @@ service cloud.firestore {
 
     match /public_vendors/{vendorId} {
       allow read: if signedIn();
-      allow create, update: if isSelf(vendorId);
-      allow delete: if isSelf(vendorId);
+      allow write: if false;
     }
 
     match /emergencies/{emergencyId} {
-      allow read: if signedIn();
-      allow create: if signedIn()
-        && request.resource.data.userId == request.auth.uid;
-      allow update: if signedIn() && request.auth.uid == resource.data.userId;
+      allow get: if signedIn()
+        && (resource.data.userId == request.auth.uid
+          || isRecentEmergencyInCallerZone());
+      allow list: if signedIn()
+        && (resource.data.userId == request.auth.uid
+          || isRecentEmergencyInCallerZone());
+      allow create: if signedIn() && isValidEmergency(emergencyId);
+      allow update: if signedIn()
+        && resource.data.userId == request.auth.uid
+        && (
+          (resource.data.status == 'active'
+            && request.resource.data.diff(resource.data).affectedKeys()
+              .hasOnly(['status', 'resolvedAt'])
+            && request.resource.data.status in ['resolved', 'cancelled']
+            && request.resource.data.resolvedAt == request.time
+            && getAfter(/databases/$(database)/documents/users/$(request.auth.uid))
+              .data.get('activeEmergencyId', null) != emergencyId)
+          || isValidEmergencySurvey(emergencyId)
+        );
+    }
+
+    function isValidEmergencySurvey(emergencyId) {
+      let response = request.resource.data.get('surveyFeedback', null);
+      let responseKeys = response.keys();
+      let changedKeys = request.resource.data.diff(resource.data).affectedKeys();
+      let falseAlarm = response.get('falseAlarm', false);
+      let nextStatus = request.resource.data.status;
+      let userPath = /databases/$(database)/documents/users/$(request.auth.uid);
+
+      return resource.data.get('surveyFeedback', null) == null
+        && response is map
+        && responseKeys.hasOnly([
+          'wasSafe', 'falseAlarm', 'receivedHelp', 'details', 'submittedAt'
+        ])
+        && responseKeys.hasAll(['wasSafe', 'submittedAt'])
+        && response.wasSafe is bool
+        && response.submittedAt == request.time
+        && ((response.wasSafe == true
+              && response.falseAlarm is bool
+              && !responseKeys.hasAny(['receivedHelp', 'details']))
+          || (response.wasSafe == false
+              && response.receivedHelp is bool
+              && (response.receivedHelp == true
+                ? !responseKeys.hasAny(['falseAlarm', 'details'])
+                : response.details is string
+                  && response.details.size() > 0
+                  && response.details.size() <= 2000
+                  && !responseKeys.hasAny(['falseAlarm']))))
+        && changedKeys.hasOnly(['surveyFeedback', 'status', 'resolvedAt'])
+        && (falseAlarm == true
+          ? nextStatus == 'false_alarm'
+            && request.resource.data.resolvedAt == request.time
+            && getAfter(userPath).data.get('activeEmergencyId', null) != emergencyId
+          : nextStatus == resource.data.status
+            && !changedKeys.hasAny(['resolvedAt']));
+    }
+
+    function isRecentEmergencyInCallerZone() {
+      let user = get(
+        /databases/$(database)/documents/users/$(request.auth.uid)
+      ).data;
+      return resource.data.status == 'active'
+        && resource.data.get('isTest', false) == false
+        && resource.data.timestamp is timestamp
+        && resource.data.timestamp >= request.time - duration.value(21, 'm')
+        && resource.data.timestamp <= request.time
+        && user.get('lastKnownLatitude', null) is number
+        && user.get('lastKnownLongitude', null) is number
+        && user.get('lastKnownLocationAt', null) is timestamp
+        && user.lastKnownLocationAt >= request.time - duration.value(24, 'h')
+        && resource.data.latitude >= user.lastKnownLatitude - 0.0035
+        && resource.data.latitude <= user.lastKnownLatitude + 0.0035
+        && resource.data.longitude >= user.lastKnownLongitude - 0.0035
+        && resource.data.longitude <= user.lastKnownLongitude + 0.0035;
     }
   }
 }

@@ -2,10 +2,10 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:areaguardian/services/firestore_service.dart';
 import 'package:areaguardian/services/location_service.dart';
 import 'package:areaguardian/screens/map_dashboard_screen.dart';
+import 'package:areaguardian/models/vendor_model.dart';
 
 class VendorHome extends StatefulWidget {
   const VendorHome({super.key});
@@ -26,8 +26,6 @@ class _VendorHomeState extends State<VendorHome> {
   // Coordenadas
   double? _shopLat;
   double? _shopLng;
-  double? _currentLat;
-  double? _currentLng;
 
   // Estado de proximidad y red
   double _distanceInMeters = 0.0;
@@ -35,6 +33,7 @@ class _VendorHomeState extends State<VendorHome> {
   bool _isActive = false;
   bool _isLoading = true;
   Timer? _proximityTimer;
+  StreamSubscription<VendorModel?>? _vendorSubscription;
 
   @override
   void initState() {
@@ -46,6 +45,7 @@ class _VendorHomeState extends State<VendorHome> {
   void dispose() {
     _proximityTimer
         ?.cancel(); // Cancelamos el temporizador al salir de la pantalla
+    _vendorSubscription?.cancel();
     super.dispose();
   }
 
@@ -61,8 +61,7 @@ class _VendorHomeState extends State<VendorHome> {
       _shopLng = prefs.getDouble('vendor_longitude');
     });
 
-    final vendor = await _firestoreService.getVendor(_vendorId);
-    if (mounted) setState(() => _isActive = vendor?.isActive ?? false);
+    _watchVendor();
 
     // Validamos la proximidad inicial de inmediato
     await _checkProximityAndUpdateStatus();
@@ -75,6 +74,22 @@ class _VendorHomeState extends State<VendorHome> {
     setState(() => _isLoading = false);
   }
 
+  void _watchVendor() {
+    if (_vendorId.isEmpty) return;
+    _vendorSubscription?.cancel();
+    _vendorSubscription = _firestoreService.watchVendor(_vendorId).listen((
+      vendor,
+    ) {
+      if (!mounted || vendor == null) return;
+      setState(() {
+        _shopName = vendor.shopName.isNotEmpty ? vendor.shopName : _shopName;
+        _shopLat = vendor.latitude;
+        _shopLng = vendor.longitude;
+        _isActive = vendor.isActive;
+      });
+    });
+  }
+
   // 2. MAGIA DE PROXIMIDAD Y ACTUALIZACIÓN AUTOMÁTICA
   Future<void> _checkProximityAndUpdateStatus() async {
     if (_vendorId.isEmpty || _shopLat == null || _shopLng == null) return;
@@ -84,15 +99,11 @@ class _VendorHomeState extends State<VendorHome> {
       final currentPosition = await _locationService.getCurrentLocationOrNull();
       if (currentPosition == null) return;
 
-      _currentLat = currentPosition.latitude;
-      _currentLng = currentPosition.longitude;
-
       // Calculamos la distancia en metros entre el puesto fijo y el celular
-      double distance = Geolocator.distanceBetween(
+      final distance = _locationService.distanceBetween(
+        currentPosition,
         _shopLat!,
         _shopLng!,
-        _currentLat!,
-        _currentLng!,
       );
 
       // Umbral de proximidad: 50 metros a la redonda se considera "en el puesto"

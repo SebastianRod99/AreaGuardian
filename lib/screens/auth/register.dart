@@ -6,10 +6,13 @@ import 'pick_location_map.dart';
 
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:areaguardian/services/firestore_service.dart';
+import 'package:areaguardian/services/session_service.dart';
+import 'package:areaguardian/services/consent_service.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geocoding/geocoding.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:areaguardian/screens/user/shake_training_screen.dart';
 
 class Register extends StatefulWidget {
   const Register({super.key});
@@ -30,9 +33,47 @@ class _RegisterState extends State<Register> {
   // Coordenadas fijas seleccionadas exclusivamente para el local comercial
   LatLng? _selectedShopCoords;
   bool _isLoading = false;
+  bool _isCheckingProfile = true;
+  String? _profileCheckError;
 
   final FirestoreService _firestoreService = FirestoreService();
+  final SessionService _sessionService = SessionService();
   final Geocoding _geocoding = Geocoding();
+
+  @override
+  void initState() {
+    super.initState();
+    _checkForExistingProfile();
+  }
+
+  Future<void> _checkForExistingProfile() async {
+    final user = FirebaseAuth.instance.currentUser;
+    if (user == null) {
+      if (mounted) setState(() => _isCheckingProfile = false);
+      return;
+    }
+
+    try {
+      final profileExists = await _sessionService.restoreSession(user);
+      if (!mounted) return;
+      if (profileExists) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (_) => const AppShell(initialIndex: 0),
+          ),
+        );
+      } else {
+        setState(() => _isCheckingProfile = false);
+      }
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _profileCheckError = 'No se pudo verificar tu perfil: $error';
+        _isCheckingProfile = false;
+      });
+    }
+  }
 
   // Función para abrir el mapa y capturar el punto exacto del PUESTO
   Future<void> _openMapPicker() async {
@@ -106,8 +147,18 @@ class _RegisterState extends State<Register> {
         );
       }
       final String userId = currentUser.uid;
-      final prefs = await SharedPreferences.getInstance();
       final String? vendorId = _isVendor ? userId : null;
+
+      if (await _sessionService.restoreSession(currentUser)) {
+        if (!mounted) return;
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute(
+            builder: (_) => const AppShell(initialIndex: 0),
+          ),
+        );
+        return;
+      }
 
       await _firestoreService.saveUserProfile(
         UserModel(
@@ -143,48 +194,74 @@ class _RegisterState extends State<Register> {
         );
 
         await _firestoreService.saveVendorProfile(newVendor);
-
-        // Guardado local independiente en SharedPreferences
-        await prefs.setString('vendor_id', userId);
-        await prefs.setString('user_id', userId);
-        await prefs.setString(
-          'vendor_name',
-          _ownerNameController.text.trim(),
-        ); // Nombre de la dueña/dueño
-        await prefs.setString(
-          'puesto_title',
-          _shopNameController.text.trim(),
-        ); // Nombre del negocio
-        await prefs.setString('vendor_address', _addressController.text.trim());
-
-        // Coordenadas fijas del puesto en el mapa principal
-        await prefs.setDouble('vendor_latitude', _selectedShopCoords!.latitude);
-        await prefs.setDouble(
-          'vendor_longitude',
-          _selectedShopCoords!.longitude,
-        );
-        await prefs.setDouble('puesto_lat', _selectedShopCoords!.latitude);
-        await prefs.setDouble('puesto_lng', _selectedShopCoords!.longitude);
-      } else {
-        // --- REGISTRO DE CLIENTE / VECINO ---
-        await prefs.setString('client_id', userId);
-        await prefs.setString('user_id', userId);
-        await prefs.setString('user_name', _ownerNameController.text.trim());
       }
 
-      await prefs.setString('user_role', _isVendor ? 'vendor' : 'client');
-      await prefs.setString('auth_uid', userId);
-      await prefs.setBool('vendor_mode_enabled', _isVendor);
-      await prefs.setBool('is_registered', true);
+      await _sessionService.restoreSession(currentUser);
+      await ConsentService().syncAcceptedConsent(userId);
 
       if (!mounted) return;
 
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(
-          builder: (context) => const AppShell(initialIndex: 0),
-        ),
-      );
+      var startTraining = false;
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        if (!mounted) return;
+        final hasCompletedTraining =
+            (prefs.getInt(ShakeTrainingScreen.completionCountKey) ?? 0) > 0;
+        final hasShownInvitation =
+            prefs.getBool(ShakeTrainingScreen.invitationShownKey) ?? false;
+        if (!hasCompletedTraining && !hasShownInvitation) {
+          await prefs.setBool(ShakeTrainingScreen.invitationShownKey, true);
+          if (!mounted) return;
+          startTraining =
+              await showDialog<bool>(
+                context: context,
+                builder: (dialogContext) => AlertDialog(
+                  title: const Text('¿Quieres probar la agitación?'),
+                  content: const Text(
+                    'Puedes practicar de forma segura. No se enviará ninguna '
+                    'alerta ni se contactará a nadie.',
+                  ),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.of(dialogContext).pop(false),
+                      child: const Text('Ahora no'),
+                    ),
+                    FilledButton(
+                      onPressed: () => Navigator.of(dialogContext).pop(true),
+                      child: const Text('Practicar'),
+                    ),
+                  ],
+                ),
+              ) ??
+              false;
+        }
+      } catch (error) {
+        debugPrint('No se pudo mostrar la invitación a practicar: $error');
+      }
+
+      if (!mounted) return;
+      if (startTraining) {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute<void>(
+            builder: (trainingContext) => ShakeTrainingScreen(
+              onDone: () => Navigator.of(trainingContext).pushAndRemoveUntil(
+                MaterialPageRoute<void>(
+                  builder: (_) => const AppShell(initialIndex: 0),
+                ),
+                (route) => false,
+              ),
+            ),
+          ),
+        );
+      } else {
+        Navigator.pushReplacement(
+          context,
+          MaterialPageRoute<void>(
+            builder: (_) => const AppShell(initialIndex: 0),
+          ),
+        );
+      }
     } catch (e) {
       setState(() => _isLoading = false);
       if (!mounted) return;
@@ -199,6 +276,41 @@ class _RegisterState extends State<Register> {
 
   @override
   Widget build(BuildContext context) {
+    if (_isCheckingProfile) {
+      return const Scaffold(
+        body: Center(
+          child: CircularProgressIndicator(color: Color(0xFF00E6A7)),
+        ),
+      );
+    }
+
+    if (_profileCheckError != null) {
+      return Scaffold(
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(_profileCheckError!, textAlign: TextAlign.center),
+                const SizedBox(height: 16),
+                ElevatedButton(
+                  onPressed: () {
+                    setState(() {
+                      _isCheckingProfile = true;
+                      _profileCheckError = null;
+                    });
+                    _checkForExistingProfile();
+                  },
+                  child: const Text('Reintentar'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
     return Scaffold(
       backgroundColor: const Color(0xFF121420),
       appBar: AppBar(

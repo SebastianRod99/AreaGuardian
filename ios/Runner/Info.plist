@@ -26,6 +26,10 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>AreaGuardian necesita la cámara para cambiar tu foto de perfil.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>AreaGuardian necesita acceder a tus fotos para cambiar tu foto de perfil.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

@@ -1,18 +1,23 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:just_audio/just_audio.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:geocoding/geocoding.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 // Importamos servicios, modelos y Firestore
 import '../services/location_service.dart';
+import '../services/directions_service.dart';
+import '../services/bogota_locality_service.dart';
 import '../services/firestore_service.dart';
 import '../models/vendor_model.dart';
 import '../models/emergency_model.dart';
+import '../utils/constant.dart';
+import '../utils/geo_utils.dart';
 
 // ==========================================
 // PANTALLA DE MAPA — OpenStreetMap + Firestore
@@ -22,11 +27,13 @@ class MapDashboardScreen extends StatefulWidget {
   /// aquí y se pinta un marcador de alerta en ese punto.
   final double? focusLatitude;
   final double? focusLongitude;
+  final String? focusSourceLabel;
 
   const MapDashboardScreen({
     super.key,
     this.focusLatitude,
     this.focusLongitude,
+    this.focusSourceLabel,
   });
 
   @override
@@ -36,25 +43,43 @@ class MapDashboardScreen extends StatefulWidget {
 class _MapDashboardScreenState extends State<MapDashboardScreen> {
   final MapController _mapController = MapController();
   final LocationService _locationService = LocationService();
+  final DirectionsService _directionsService = DirectionsService();
   final FirestoreService _firestoreService = FirestoreService();
+  final AudioPlayer _emergencyPlayer = AudioPlayer();
+  final Geocoding _geocoding = Geocoding();
+  StreamSubscription<Position>? _userPositionSubscription;
 
   // Ubicación EN VIVO del usuario actual (dueño o cliente) — centra el mapa
   // y, si el rol es cliente, es también su propio marcador (HU-06).
   LatLng? _myLocation;
   // Ubicación FIJA de mi puesto — solo aplica a vendedores.
   LatLng? _myPuestoLocation;
+  LatLng? _lastGeocodedLocation;
+  LatLng? _pendingGeocodedLocation;
+  bool _isGeocodingLocation = false;
 
-  bool _isLoading = true;
+  bool _locationPermissionPending = true;
   bool _locationDenied = false;
+  bool _mapReady = false;
+  bool _hasCenteredOnGps = false;
+  LatLng? _pendingMapCenter;
   bool _isVendorRole = false;
+  bool _isEmergencyAlarmMuted = false;
+  bool _isEmergencyAlarmPlaying = false;
 
   String _myPuestoTitle = 'Mi Puesto';
   String _myAddress = '';
+  String? _neighborhood;
+  String _locality = 'Bogotá';
   String _vendorId = '';
+  String _userId = '';
+  LatLng? _emergencyQueryCenter;
+  int _emergencyQueryGeneration = 0;
 
   // Lista de puestos dinámicos obtenidos desde Firebase Firestore
   List<VendorModel> _puestosVecinos = [];
   List<EmergencyModel> _emergencies = [];
+  StreamSubscription<List<VendorModel>>? _vendorSubscription;
   StreamSubscription<List<EmergencyModel>>? _emergencySubscription;
   Timer? _emergencyExpiryTimer;
   VendorModel? _selectedVendorPuesto;
@@ -80,68 +105,146 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
           .where((emergency) => emergency.timestamp.isAfter(cutoff))
           .toList();
     });
+    _syncEmergencyAlarm();
   }
 
-  void _watchActiveEmergencies() {
+  void _watchActiveEmergencies({required LatLng center}) {
     _emergencySubscription?.cancel();
-    _emergencySubscription = _firestoreService.watchActiveEmergencies().listen((
-      emergencies,
-    ) {
-      if (mounted) setState(() => _emergencies = emergencies);
-    });
+    if (_userId.isEmpty) {
+      setState(() => _emergencies = []);
+      unawaited(_stopEmergencyAlarm());
+      return;
+    }
+    _emergencySubscription = _firestoreService
+        .watchActiveEmergencies(
+          latitude: center.latitude,
+          longitude: center.longitude,
+        )
+        .listen(
+          (emergencies) {
+            if (!mounted) return;
+            setState(
+              () => _emergencies = _filterEmergenciesAtCurrentLocation(
+                emergencies,
+              ),
+            );
+            _syncEmergencyAlarm();
+          },
+          onError: (Object error) {
+            debugPrint('No se pudieron actualizar emergencias cercanas: $error');
+            if (mounted) {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(
+                  content: Text('No se pudieron actualizar alertas cercanas.'),
+                ),
+              );
+            }
+          },
+        );
   }
 
-  Future<void> _loadMyPuestoAndLocation() async {
-    // 1. Cargamos datos locales del usuario (rol + datos del puesto si aplica)
-    final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _isVendorRole = (prefs.getString('user_role') ?? '') == 'vendor';
-      _vendorId = prefs.getString('vendor_id') ?? '';
-      _myPuestoTitle = prefs.getString('puesto_title') ?? 'Mi Puesto';
-      _myAddress = prefs.getString('vendor_address') ?? '';
-    });
+  bool _isOwnEmergency(EmergencyModel emergency) {
+    return emergency.userId == _userId ||
+        (_vendorId.isNotEmpty && emergency.userId == _vendorId);
+  }
 
-    // 2. Gestionamos permisos y obtenemos ubicación con nuestro LocationService
-    final status = await Permission.location.request();
-    if (status.isDenied || status.isPermanentlyDenied) {
-      setState(() {
-        _locationDenied = true;
-      });
-      _watchActiveEmergencies();
+  Future<void> _playEmergencyAlarm() async {
+    if (_isEmergencyAlarmPlaying || _isEmergencyAlarmMuted) return;
+    try {
+      await _emergencyPlayer.setAsset('assets/audio/alarm.mp3');
+      await _emergencyPlayer.setLoopMode(LoopMode.all);
+      await _emergencyPlayer.play();
+      _isEmergencyAlarmPlaying = true;
+    } catch (error) {
+      debugPrint('No se pudo reproducir la alarma de emergencia: $error');
+    }
+  }
+
+  Future<void> _stopEmergencyAlarm() async {
+    if (!_isEmergencyAlarmPlaying && !_emergencyPlayer.playing) return;
+    _isEmergencyAlarmPlaying = false;
+    try {
+      await _emergencyPlayer.stop();
+    } catch (error) {
+      debugPrint('No se pudo detener la alarma de emergencia: $error');
+    }
+  }
+
+  void _syncEmergencyAlarm() {
+    final myVendor = _puestosVecinos
+        .where((vendor) => vendor.id == _vendorId)
+        .firstOrNull;
+    final location = _myLocation;
+    if (_isEmergencyAlarmMuted ||
+        !_isVendorRole ||
+        myVendor?.isActive != true ||
+        location == null) {
+      unawaited(_stopEmergencyAlarm());
+      return;
     }
 
-    try {
-      Position position = await _locationService.getCurrentLocation();
-      LatLng currentLatLng = LatLng(position.latitude, position.longitude);
+    final hasNearbyEmergency = _emergencies.any(
+      (emergency) =>
+          !_isOwnEmergency(emergency) &&
+          isWithinRadiusMeters(
+            latitudeA: location.latitude,
+            longitudeA: location.longitude,
+            latitudeB: emergency.latitude,
+            longitudeB: emergency.longitude,
+            radiusMeters: FirestoreService.emergencyAlertRadiusMeters,
+          ),
+    );
+    if (hasNearbyEmergency) {
+      unawaited(_playEmergencyAlarm());
+    } else {
+      unawaited(_stopEmergencyAlarm());
+    }
+  }
 
-      // Ubicación FIJA del puesto — solo tiene sentido para vendedores.
-      // Un cliente nunca marcó 'vendor_latitude/longitude', así que su
-      // marcador de "puesto" simplemente no se pinta (ver _buildMap).
-      LatLng? fixedPuestoLatLng;
-      if (_isVendorRole) {
-        final double? fixedLat = prefs.getDouble('vendor_latitude');
-        final double? fixedLng = prefs.getDouble('vendor_longitude');
-        fixedPuestoLatLng = (fixedLat != null && fixedLng != null)
-            ? LatLng(fixedLat, fixedLng)
-            : currentLatLng; // fallback solo si nunca marcó su puesto
-      }
+  List<EmergencyModel> _filterEmergenciesAtCurrentLocation(
+    List<EmergencyModel> emergencies,
+  ) {
+    final location = _myLocation;
+    if (location == null) return [];
+    return emergencies
+        .where(
+          (emergency) => isWithinRadiusMeters(
+            latitudeA: location.latitude,
+            longitudeA: location.longitude,
+            latitudeB: emergency.latitude,
+            longitudeB: emergency.longitude,
+            radiusMeters: FirestoreService.emergencyAlertRadiusMeters,
+          ),
+        )
+        .toList();
+  }
 
-      setState(() {
-        _myPuestoLocation = fixedPuestoLatLng;
-        _myLocation = currentLatLng;
-      });
+  Future<void> _toggleEmergencyAlarmMute() async {
+    final nextMuted = !_isEmergencyAlarmMuted;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('map_emergency_alarm_muted', nextMuted);
+    if (!mounted) return;
+    setState(() => _isEmergencyAlarmMuted = nextMuted);
+    _syncEmergencyAlarm();
+  }
 
-      // 3. Consultamos los puestos reales directamente desde Firestore
-      List<VendorModel> vendors = await _firestoreService.fetchNearbyVendors();
-      List<EmergencyModel> emergencies = await _firestoreService
-          .fetchActiveEmergencies();
+  void _watchPublicVendors() {
+    _vendorSubscription?.cancel();
+    _vendorSubscription = _firestoreService.watchPublicVendors().listen((
+      vendors,
+    ) {
+      if (!mounted) return;
 
+      final myVendor = vendors
+          .where((vendor) => vendor.id == _vendorId)
+          .firstOrNull;
       setState(() {
         _puestosVecinos = vendors;
-        _emergencies = emergencies;
-        final myVendor = vendors
-            .where((vendor) => vendor.id == _vendorId)
-            .firstOrNull;
+        if (_selectedVendorPuesto != null) {
+          _selectedVendorPuesto = vendors
+              .where((vendor) => vendor.id == _selectedVendorPuesto!.id)
+              .firstOrNull;
+        }
         if (myVendor != null) {
           _myPuestoTitle = myVendor.shopName.isNotEmpty
               ? myVendor.shopName
@@ -149,36 +252,304 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
           _myAddress = myVendor.address.isNotEmpty
               ? myVendor.address
               : _myAddress;
+          if (_isVendorRole &&
+              myVendor.latitude != 0 &&
+              myVendor.longitude != 0) {
+            _myPuestoLocation = LatLng(myVendor.latitude, myVendor.longitude);
+          }
         }
-        _isLoading = false;
       });
-      _watchActiveEmergencies();
+      _syncEmergencyAlarm();
+    });
+  }
 
-      // HU-05: si llegamos desde una notificación de emergencia, centramos
-      // el mapa ahí en cuanto el widget termine de construirse.
-      if (widget.focusLatitude != null && widget.focusLongitude != null) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          _mapController.move(
-            LatLng(widget.focusLatitude!, widget.focusLongitude!),
-            18,
-          );
+  Future<void> _loadMyPuestoAndLocation() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (!mounted) return;
+      setState(() {
+        _isVendorRole = (prefs.getString('user_role') ?? '') == 'vendor';
+        _vendorId = prefs.getString('vendor_id') ?? '';
+        _userId =
+            FirebaseAuth.instance.currentUser?.uid ??
+            prefs.getString('user_id') ??
+            '';
+        _myPuestoTitle = prefs.getString('puesto_title') ?? 'Mi Puesto';
+        _myAddress = prefs.getString('vendor_address') ?? '';
+        _isEmergencyAlarmMuted =
+            prefs.getBool('map_emergency_alarm_muted') ?? false;
+      });
+      _watchPublicVendors();
+
+      final fixedLatitude = prefs.getDouble('vendor_latitude');
+      final fixedLongitude = prefs.getDouble('vendor_longitude');
+      LatLng? fixedPuestoLatLng;
+      if (_isVendorRole && fixedLatitude != null && fixedLongitude != null) {
+        fixedPuestoLatLng = LatLng(fixedLatitude, fixedLongitude);
+      }
+      setState(() {
+        _myPuestoLocation = fixedPuestoLatLng;
+      });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) unawaited(_loadLocation());
+      });
+    } catch (error) {
+      debugPrint('No se pudieron cargar los datos locales del mapa: $error');
+      if (mounted) {
+        setState(() {
+          _locationPermissionPending = false;
+          _locationDenied = true;
         });
       }
-    } catch (e) {
-      // Coordenadas por defecto en caso de error (Bogotá)
-      const fallbackLatLng = LatLng(4.6742, -74.1468);
-      setState(() {
-        _myLocation = fallbackLatLng;
-        _myPuestoLocation = _isVendorRole ? fallbackLatLng : null;
-        _isLoading = false;
-      });
     }
+  }
+
+  Future<void> _loadLocation() async {
+    final permission = await LocationService.ensureLocationPermission();
+    if (!mounted) return;
+
+    final hasPermission =
+        permission == LocationPermission.always ||
+        permission == LocationPermission.whileInUse;
+    setState(() {
+      _locationPermissionPending = false;
+      _locationDenied = !hasPermission;
+    });
+    debugPrint('Map location permission resolved: $permission');
+    if (!hasPermission) {
+      _emergencyQueryCenter = null;
+      _emergencySubscription?.cancel();
+      setState(() => _emergencies = []);
+      return;
+    }
+
+    _watchUserLocation();
+    final lastKnownPosition = await _locationService
+        .getLastKnownLocationOrNull();
+    if (!mounted) return;
+    if (lastKnownPosition != null) {
+      debugPrint('Map received last known location');
+      _applyLocation(lastKnownPosition);
+    }
+    unawaited(_loadFreshLocation());
+  }
+
+  Future<void> _loadFreshLocation() async {
+    final position = await _locationService.getFreshLocationOrNull();
+    if (!mounted) return;
+    if (position == null) {
+      if (_myLocation == null) setState(() => _locationDenied = true);
+      return;
+    }
+    debugPrint('Map received fresh location');
+    _applyLocation(position);
+  }
+
+  void _applyLocation(Position position) {
+    final location = LatLng(position.latitude, position.longitude);
+    setState(() {
+      _myLocation = location;
+      _locationDenied = false;
+    });
+    _centerMapOnLocation(location);
+    _syncEmergencyAlarm();
+    unawaited(_updateLocationNames(location));
+    if (FirebaseAuth.instance.currentUser != null) {
+      unawaited(_loadEmergenciesAtLocation(location));
+    }
+  }
+
+  void _centerMapOnLocation(LatLng location) {
+    if (widget.focusLatitude != null && widget.focusLongitude != null) {
+      return;
+    }
+    _hasCenteredOnGps = true;
+    if (!_mapReady) {
+      _pendingMapCenter = location;
+      return;
+    }
+    _mapController.move(location, 17);
+  }
+
+  Future<void> _loadEmergenciesAtLocation(LatLng location) async {
+    final generation = ++_emergencyQueryGeneration;
+    try {
+      await _firestoreService.updateUserCurrentLocation(
+        latitude: location.latitude,
+        longitude: location.longitude,
+      );
+      _emergencyQueryCenter = location;
+    } catch (error) {
+      debugPrint('No se pudo actualizar la ubicación de consulta: $error');
+    }
+
+    var emergencies = <EmergencyModel>[];
+    try {
+      emergencies = await _firestoreService.fetchActiveEmergencies(
+        latitude: location.latitude,
+        longitude: location.longitude,
+      );
+    } catch (error) {
+      debugPrint('No se pudieron cargar emergencias cercanas: $error');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No se pudieron cargar alertas cercanas.'),
+          ),
+        );
+      }
+    }
+
+    if (!mounted || generation != _emergencyQueryGeneration) return;
+    setState(
+      () => _emergencies = _filterEmergenciesAtCurrentLocation(emergencies),
+    );
+    _watchActiveEmergencies(center: location);
+  }
+
+  void _watchUserLocation() {
+    _userPositionSubscription?.cancel();
+    _userPositionSubscription =
+        Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(distanceFilter: 25),
+        ).listen(
+          (position) {
+            if (!mounted) return;
+            final location = LatLng(position.latitude, position.longitude);
+            setState(() {
+              _myLocation = location;
+              _emergencies = _filterEmergenciesAtCurrentLocation(_emergencies);
+              _locationDenied = false;
+            });
+            if (!_hasCenteredOnGps) _centerMapOnLocation(location);
+            _syncEmergencyAlarm();
+            unawaited(_updateLocationNames(location));
+            final queryCenter = _emergencyQueryCenter;
+            if (FirebaseAuth.instance.currentUser != null &&
+                (queryCenter == null ||
+                Geolocator.distanceBetween(
+                      queryCenter.latitude,
+                      queryCenter.longitude,
+                      location.latitude,
+                      location.longitude,
+                    ) >=
+                    150)) {
+              unawaited(_refreshNearbyEmergencies(location));
+            }
+          },
+          onError: (Object error) {
+            debugPrint('No se pudo actualizar la ubicación del mapa: $error');
+            if (mounted && _myLocation == null) {
+              setState(() => _locationDenied = true);
+            }
+          },
+        );
+  }
+
+  Future<void> _refreshNearbyEmergencies(LatLng location) async {
+    final generation = ++_emergencyQueryGeneration;
+    try {
+      await _firestoreService.updateUserCurrentLocation(
+        latitude: location.latitude,
+        longitude: location.longitude,
+      );
+      final emergencies = await _firestoreService.fetchActiveEmergencies(
+        latitude: location.latitude,
+        longitude: location.longitude,
+      );
+      if (!mounted || generation != _emergencyQueryGeneration) return;
+      _emergencyQueryCenter = location;
+      setState(
+        () => _emergencies = _filterEmergenciesAtCurrentLocation(emergencies),
+      );
+      _watchActiveEmergencies(center: location);
+      _syncEmergencyAlarm();
+    } catch (error) {
+      debugPrint('No se pudieron renovar emergencias de la zona: $error');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No se pudieron actualizar alertas de tu zona.'),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _updateLocationNames(LatLng location) async {
+    if (_isGeocodingLocation) {
+      _pendingGeocodedLocation = location;
+      return;
+    }
+    final previousLocation = _lastGeocodedLocation;
+    if (previousLocation != null &&
+        Geolocator.distanceBetween(
+              previousLocation.latitude,
+              previousLocation.longitude,
+              location.latitude,
+              location.longitude,
+            ) <
+            150) {
+      return;
+    }
+    _lastGeocodedLocation = location;
+    _isGeocodingLocation = true;
+    var locality = 'Bogotá';
+    try {
+      final localityService = await BogotaLocalityService.load();
+      locality = localityService.localityAt(location) ?? 'Fuera de Bogotá';
+    } catch (error) {
+      debugPrint('No se pudo cargar la geometría de localidades: $error');
+    }
+
+    String? neighborhood;
+    try {
+      final placemarks = await _geocoding.placemarkFromCoordinates(
+        location.latitude,
+        location.longitude,
+      );
+      final placemark = placemarks.firstOrNull;
+      neighborhood = _firstNonEmpty([placemark?.subLocality]);
+    } catch (error) {
+      debugPrint('No se pudo identificar el barrio: $error');
+    } finally {
+      _isGeocodingLocation = false;
+      final pendingLocation = _pendingGeocodedLocation;
+      _pendingGeocodedLocation = null;
+      if (pendingLocation != null &&
+          Geolocator.distanceBetween(
+                location.latitude,
+                location.longitude,
+                pendingLocation.latitude,
+                pendingLocation.longitude,
+              ) >=
+              150) {
+        unawaited(_updateLocationNames(pendingLocation));
+      }
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _neighborhood = neighborhood;
+      _locality = locality;
+    });
+  }
+
+  String? _firstNonEmpty(Iterable<String?> values) {
+    for (final value in values) {
+      final trimmedValue = value?.trim();
+      if (trimmedValue != null && trimmedValue.isNotEmpty) return trimmedValue;
+    }
+    return null;
   }
 
   @override
   void dispose() {
+    _userPositionSubscription?.cancel();
+    _vendorSubscription?.cancel();
     _emergencySubscription?.cancel();
     _emergencyExpiryTimer?.cancel();
+    _emergencyPlayer.dispose();
     super.dispose();
   }
 
@@ -196,24 +567,15 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   }
 
   Future<void> _openDirections(VendorModel puesto) async {
-    final destination = '${puesto.latitude},${puesto.longitude}';
-    final navigationUris = [
-      Uri.parse('comgooglemaps://?daddr=$destination&directionsmode=driving'),
-      Uri.parse('waze://?ll=$destination&navigate=yes'),
-      Uri.parse(
-        'https://www.google.com/maps/dir/?api=1&destination=$destination',
-      ),
-    ];
-
-    for (final uri in navigationUris) {
-      if (await canLaunchUrl(uri)) {
-        await launchUrl(uri, mode: LaunchMode.externalApplication);
-        return;
-      }
-    }
-    if (mounted) {
+    final opened = await _directionsService.openWalkingDirections(
+      destinationLatitude: puesto.latitude,
+      destinationLongitude: puesto.longitude,
+    );
+    if (mounted && !opened) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No se pudo abrir Google Maps ni Waze.')),
+        const SnackBar(
+          content: Text('No se pudo abrir una aplicación de rutas.'),
+        ),
       );
     }
   }
@@ -240,25 +602,20 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
           children: [
             _buildHeader(activosCount),
             Expanded(
-              child: _isLoading
-                  ? const Center(
-                      child: CircularProgressIndicator(
-                        color: Color(0xFF00E6A7),
-                      ),
-                    )
-                  : Stack(
-                      children: [
-                        _buildMap(),
-                        _buildLegend(),
-                        _buildCenterButton(),
-                        if (showingEmergency) _buildEmergencyBanner(),
-                        if (_locationDenied && !showingEmergency)
-                          _buildLocationWarning(),
-                        if (_selectedVendorPuesto != null ||
-                            _isMyPuestoSelected)
-                          _buildPuestoCard(),
-                      ],
-                    ),
+              child: Stack(
+                children: [
+                  _buildMap(),
+                  _buildLegend(),
+                  _buildCenterButton(),
+                  if (showingEmergency || _emergencies.isNotEmpty)
+                    _buildEmergencyBanner(),
+                  if ((_locationDenied || _locationPermissionPending) &&
+                      !showingEmergency)
+                    _buildLocationWarning(),
+                  if (_selectedVendorPuesto != null || _isMyPuestoSelected)
+                    _buildPuestoCard(),
+                ],
+              ),
             ),
           ],
         ),
@@ -272,38 +629,70 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       padding: const EdgeInsets.fromLTRB(20, 16, 20, 12),
       color: const Color(0xFF121420),
       child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Text(
-                'Mapa de Puestos',
-                style: TextStyle(
-                  fontSize: 20,
-                  fontWeight: FontWeight.bold,
-                  color: Colors.white,
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Mapa de Puestos',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
                 ),
-              ),
-              Text(
-                'Fontibón • ${_puestosVecinos.length} puestos • $activosCount activos',
-                style: const TextStyle(color: Colors.white54, fontSize: 12),
-              ),
-            ],
+                Text(
+                  '$_locality • ${_puestosVecinos.length} puestos • $activosCount activos',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white54, fontSize: 12),
+                ),
+              ],
+            ),
           ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          const SizedBox(width: 8),
+          if (_neighborhood != null)
+            Container(
+            constraints: const BoxConstraints(maxWidth: 130),
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
             decoration: BoxDecoration(
               color: const Color(0xFF1D2030),
               borderRadius: BorderRadius.circular(10),
             ),
             child: Row(
-              children: const [
-                Icon(Icons.location_city, color: Color(0xFF00E6A7), size: 14),
-                SizedBox(width: 6),
-                Text(
-                  'Parque Central',
-                  style: TextStyle(color: Colors.white70, fontSize: 12),
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.location_city,
+                  color: Color(0xFF00E6A7),
+                  size: 14,
+                ),
+                const SizedBox(width: 6),
+                Flexible(
+                  child: Text(
+                    _neighborhood!,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(color: Colors.white70, fontSize: 12),
+                    ),
+                ),
+                if (_isVendorRole)
+                IconButton(
+                  tooltip: _isEmergencyAlarmMuted
+                      ? 'Activar sonido de alarmas'
+                      : 'Silenciar alarmas',
+                  onPressed: _toggleEmergencyAlarmMute,
+                  icon: Icon(
+                    _isEmergencyAlarmMuted
+                        ? Icons.notifications_off_outlined
+                        : Icons.notifications_active_outlined,
+                    color: _isEmergencyAlarmMuted
+                        ? Colors.white54
+                        : const Color(0xFFFFB300),
+                  ),
                 ),
               ],
             ),
@@ -320,6 +709,18 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       options: MapOptions(
         initialCenter: _myLocation ?? const LatLng(4.6742, -74.1468),
         initialZoom: 16.5,
+        onMapReady: () {
+          _mapReady = true;
+          if (widget.focusLatitude != null && widget.focusLongitude != null) {
+            _mapController.move(
+              LatLng(widget.focusLatitude!, widget.focusLongitude!),
+              18,
+            );
+          } else if (_pendingMapCenter != null) {
+            _mapController.move(_pendingMapCenter!, 17);
+            _pendingMapCenter = null;
+          }
+        },
         onTap: (_, __) => setState(() {
           _selectedVendorPuesto = null;
           _isMyPuestoSelected = false;
@@ -345,14 +746,24 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                     _selectedVendorPuesto = null;
                   }),
                   child: _buildMarkerWidget(
-                    color: const Color(0xFF00E6A7),
+                    color: myVendorColor,
                     icon: Icons.storefront,
-                    isMe: true,
                   ),
                 ),
               ),
 
             // Marcador rojo de una emergencia activa.
+            if (_myLocation != null)
+              Marker(
+                point: _myLocation!,
+                width: 40,
+                height: 40,
+                child: _buildMarkerWidget(
+                  color: const Color(0xFF448AFF),
+                  icon: Icons.person_pin_circle,
+                ),
+              ),
+
             ..._emergencies.map(
               (emergency) => Marker(
                 point: LatLng(emergency.latitude, emergency.longitude),
@@ -373,22 +784,24 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
               ),
 
             // Puestos de la red: únicamente su ubicación comercial fija.
-            ..._puestosVecinos.map(
-              (puesto) => Marker(
-                point: LatLng(puesto.latitude, puesto.longitude),
-                width: 40,
-                height: 40,
-                child: GestureDetector(
-                  onTap: () => _selectVecino(puesto),
-                  child: _buildMarkerWidget(
-                    icon: Icons.store_outlined,
-                    color: puesto.isActive
-                        ? const Color(0xFF00E6A7)
-                        : Colors.grey,
+            ..._puestosVecinos
+                .where((puesto) => puesto.id != _vendorId)
+                .map(
+                  (puesto) => Marker(
+                    point: LatLng(puesto.latitude, puesto.longitude),
+                    width: 40,
+                    height: 40,
+                    child: GestureDetector(
+                      onTap: () => _selectVecino(puesto),
+                      child: _buildMarkerWidget(
+                        icon: Icons.store_outlined,
+                        color: puesto.isActive
+                            ? const Color(0xFF00E6A7)
+                            : Colors.grey,
+                      ),
+                    ),
                   ),
                 ),
-              ),
-            ),
           ],
         ),
       ],
@@ -413,16 +826,12 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     );
   }
 
-  Widget _buildMarkerWidget({
-    required Color color,
-    required IconData icon,
-    bool isMe = false,
-  }) {
+  Widget _buildMarkerWidget({required Color color, required IconData icon}) {
     return Container(
       decoration: BoxDecoration(
-        color: isMe ? const Color(0xFF00E6A7) : const Color(0xFF1D2030),
+        color: const Color(0xFF1D2030),
         shape: BoxShape.circle,
-        border: Border.all(color: isMe ? Colors.white : color, width: 2),
+        border: Border.all(color: color, width: 2),
         boxShadow: [
           BoxShadow(
             color: Colors.black.withOpacity(0.3),
@@ -431,11 +840,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
           ),
         ],
       ),
-      child: Icon(
-        icon,
-        size: isMe ? 22 : 18,
-        color: isMe ? Colors.black : color,
-      ),
+      child: Icon(icon, size: 18, color: color),
     );
   }
 
@@ -453,14 +858,15 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _legendItem(
-              const Color(0xFF00E6A7),
-              _isVendorRole ? 'Mi puesto' : 'Yo',
-            ),
+            _legendItem(myVendorColor, 'Mi puesto'),
             const SizedBox(height: 4),
-            _legendItem(const Color(0xFF00E6A7), 'Activo'),
+            _legendItem(const Color(0xFF448AFF), 'Yo'),
+            const SizedBox(height: 4),
+            _legendItem(const Color(0xFF00E6A7), 'Puesto activo'),
             const SizedBox(height: 4),
             _legendItem(Colors.grey, 'Inactivo'),
+            const SizedBox(height: 4),
+            _legendItem(Colors.red, 'Emergencia'),
           ],
         ),
       ),
@@ -515,6 +921,9 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
 
   // ── AVISO UBICACIÓN DENEGADA ──────────────────────────────────────────────
   Widget _buildLocationWarning() {
+    final message = _locationPermissionPending
+        ? 'Esperando permiso de ubicación — mostrando Bogotá'
+        : 'Ubicación no disponible — mostrando Bogotá';
     return Positioned(
       top: 12,
       left: 12,
@@ -525,14 +934,20 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
           color: Colors.orange.withOpacity(0.9),
           borderRadius: BorderRadius.circular(10),
         ),
-        child: const Row(
+        child: Row(
           children: [
-            Icon(Icons.location_off, color: Colors.white, size: 16),
-            SizedBox(width: 8),
+            Icon(
+              _locationPermissionPending
+                  ? Icons.location_searching
+                  : Icons.location_off,
+              color: Colors.white,
+              size: 16,
+            ),
+            const SizedBox(width: 8),
             Expanded(
               child: Text(
-                'Ubicación no disponible — mostrando Fontibón',
-                style: TextStyle(color: Colors.white, fontSize: 11),
+                message,
+                style: const TextStyle(color: Colors.white, fontSize: 11),
               ),
             ),
           ],
@@ -543,6 +958,14 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
 
   // ── AVISO DE EMERGENCIA (HU-05) ───────────────────────────────────────────
   Widget _buildEmergencyBanner() {
+    final activeEmergency = _emergencies.firstOrNull;
+    final sourceLabel =
+        widget.focusSourceLabel ??
+        (activeEmergency?.role == 'vendor' &&
+                activeEmergency!.shopName.trim().isNotEmpty
+            ? activeEmergency.shopName
+            : 'un vecino en la vía pública');
+
     return Positioned(
       top: 12,
       left: 12,
@@ -553,14 +976,18 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
           color: Colors.red.withOpacity(0.92),
           borderRadius: BorderRadius.circular(10),
         ),
-        child: const Row(
+        child: Row(
           children: [
-            Icon(Icons.warning_amber_rounded, color: Colors.white, size: 16),
-            SizedBox(width: 8),
+            const Icon(
+              Icons.warning_amber_rounded,
+              color: Colors.white,
+              size: 16,
+            ),
+            const SizedBox(width: 8),
             Expanded(
               child: Text(
-                '🚨 Emergencia cerca — ve al punto marcado en rojo',
-                style: TextStyle(
+                '🚨 Alerta en $sourceLabel — ve al punto marcado en rojo',
+                style: const TextStyle(
                   color: Colors.white,
                   fontSize: 11,
                   fontWeight: FontWeight.bold,
@@ -617,19 +1044,19 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                   height: 56,
                   decoration: BoxDecoration(
                     color: isMe
-                        ? const Color(0xFF00E6A7).withOpacity(0.12)
+                        ? myVendorColor.withOpacity(0.12)
                         : Colors.white.withOpacity(0.06),
                     borderRadius: BorderRadius.circular(14),
                     border: Border.all(
                       color: isMe
-                          ? const Color(0xFF00E6A7).withOpacity(0.4)
+                          ? myVendorColor.withOpacity(0.4)
                           : Colors.white12,
                     ),
                   ),
                   child: Icon(
                     isMe ? Icons.storefront : Icons.store_outlined,
                     size: 26,
-                    color: isMe ? const Color(0xFF00E6A7) : Colors.white54,
+                    color: isMe ? myVendorColor : Colors.white54,
                   ),
                 ),
                 const SizedBox(width: 14),

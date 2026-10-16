@@ -4,35 +4,63 @@ class EmergencyModel {
   final String id;
   final String userId;
   final String userName;
+  final String role;
+  final String shopName;
   final double latitude;
   final double longitude;
   final DateTime timestamp;
   final String status; // 'active', 'resolved'
-  // Puestos activos que quedaron dentro del radio al momento de crear la
-  // emergencia (calculado en FirestoreService.createEmergency). Es lo que
-  // lee la Cloud Function para saber a quién notificar.
+  final String smsStatus; // 'pending', 'sent', 'failed'
+  final bool isTest;
+  // Puestos activos dentro del radio. El backend recalcula esta lista antes
+  // de enviar notificaciones y nunca confía en una lista del cliente.
   final List<String> notifiedVendorIds;
 
   EmergencyModel({
     required this.id,
     required this.userId,
     required this.userName,
+    required this.role,
+    required this.shopName,
     required this.latitude,
     required this.longitude,
     required this.timestamp,
     this.status = 'active',
+    this.smsStatus = 'pending',
+    this.isTest = false,
     this.notifiedVendorIds = const [],
   });
+
+  EmergencyModel copyWithSmsStatus(String value) {
+    return EmergencyModel(
+      id: id,
+      userId: userId,
+      userName: userName,
+      role: role,
+      shopName: shopName,
+      latitude: latitude,
+      longitude: longitude,
+      timestamp: timestamp,
+      status: status,
+      smsStatus: value,
+      isTest: isTest,
+      notifiedVendorIds: notifiedVendorIds,
+    );
+  }
 
   Map<String, dynamic> toJson() {
     return {
       'id': id,
       'userId': userId,
       'userName': userName,
+      'role': role,
+      'shopName': shopName,
       'latitude': latitude,
       'longitude': longitude,
       'timestamp': timestamp.toIso8601String(),
       'status': status,
+      'smsStatus': smsStatus,
+      'isTest': isTest,
       'notifiedVendorIds': notifiedVendorIds,
     };
   }
@@ -42,10 +70,14 @@ class EmergencyModel {
       id: json['id'] ?? '',
       userId: json['userId'] ?? '',
       userName: json['userName'] ?? '',
+      role: json['role'] ?? 'client',
+      shopName: json['shopName'] ?? 'Vecino',
       latitude: json['latitude']?.toDouble() ?? 0.0,
       longitude: json['longitude']?.toDouble() ?? 0.0,
       timestamp: _parseTimestamp(json['timestamp']),
       status: json['status'] ?? 'active',
+      smsStatus: json['smsStatus'] ?? 'pending',
+      isTest: json['isTest'] == true,
       notifiedVendorIds:
           (json['notifiedVendorIds'] as List<dynamic>?)
               ?.map((e) => e.toString())

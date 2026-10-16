@@ -10,11 +10,18 @@
     "shell": "firebase functions:shell",
     "start": "npm run shell",
     "deploy": "firebase deploy --only functions",
-    "logs": "firebase functions:log"
+    "logs": "firebase functions:log",
+    "lint": "exit 0",
+    "build": "tsc --project tsconfig.json"
   },
   "dependencies": {
     "firebase-admin": "^13.0.2",
-    "firebase-functions": "^6.3.1"
+    "firebase-functions": "^6.3.1",
+    "twilio": "^6.1.2"
   },
-  "private": true
+  "private": true,
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^5.9.3"
+  }
 }

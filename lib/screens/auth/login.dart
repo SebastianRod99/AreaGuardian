@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:areaguardian/widgets/bar_nav.dart';
 import 'package:areaguardian/services/auth_service.dart';
+import 'package:areaguardian/services/session_service.dart';
+import 'package:areaguardian/services/consent_service.dart';
+import 'package:areaguardian/screens/consent_screen.dart';
 import 'package:areaguardian/screens/map_dashboard_screen.dart';
 
 import 'register.dart';
@@ -30,21 +32,34 @@ class _LoginScreenState extends State<LoginScreen> {
 
     try {
       await _authService.signInWithGoogle();
-      final prefs = await SharedPreferences.getInstance();
-      final uid = _authService.currentUser!.uid;
-      final previousUid = prefs.getString('auth_uid');
-      final isSameAccount = previousUid == uid;
-      await prefs.setString('auth_uid', uid);
-      await prefs.setBool('is_logged_in', true);
-      final isRegistered =
-          isSameAccount && (prefs.getBool('is_registered') ?? false);
+      final user = _authService.currentUser;
+      if (user == null) {
+        throw StateError('No se encontró la sesión de Google.');
+      }
+      final isRegistered = await SessionService().restoreSession(user);
+      final needsConsent = !await ConsentService().hasCurrentConsent(
+        userId: user.uid,
+      );
 
       if (!mounted) return;
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
-          builder: (_) =>
-              isRegistered ? const AppShell(initialIndex: 0) : const Register(),
+          builder: (routeContext) => needsConsent
+              ? ConsentScreen(
+                  onAccepted: () async {
+                    Navigator.of(routeContext).pushReplacement(
+                      MaterialPageRoute(
+                        builder: (_) => isRegistered
+                            ? const AppShell(initialIndex: 0)
+                            : const Register(),
+                      ),
+                    );
+                  },
+                )
+              : isRegistered
+              ? const AppShell(initialIndex: 0)
+              : const Register(),
         ),
       );
     } on FirebaseAuthException catch (error) {

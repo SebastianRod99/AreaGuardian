@@ -1,10 +1,17 @@
+import 'dart:async';
+
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:areaguardian/models/emergency_model.dart';
 import 'package:areaguardian/screens//user/home.dart';
 import 'package:areaguardian/screens/map_dashboard_screen.dart';
 import 'package:areaguardian/screens/account_config_screen.dart';
 import 'package:areaguardian/screens/user/security.dart';
+import 'package:areaguardian/services/firestore_service.dart';
 import 'package:areaguardian/services/notification_service.dart';
+import 'package:areaguardian/services/protection_service.dart';
+import 'package:areaguardian/services/location_service.dart';
 
 // ==========================================
 // NAVEGACIÓN PRINCIPAL CON BOTTOM NAV BAR
@@ -18,21 +25,35 @@ class AppShell extends StatefulWidget {
 }
 
 class _AppShellState extends State<AppShell> {
+  static final Set<String> _shownRecoveryPrompts = {};
+
   late int _currentIndex;
+  late DateTime _sessionStartedAt;
+  String? _activeEmergencyIdAtStart;
+  Timer? _pendingEmergencyTimeout;
+  BuildContext? _recoveryDialogContext;
 
   // Pantallas del nav bar — en orden
-  final List<Widget> _screens = const [
-    MainScreen(), // 0 — Inicio / Seguridad
-    SecurityScreen(), // 1 — Seguridad dedicada
-    MapDashboardScreen(), // 2 — Mapa
-    AccountConfigScreen(), // 3 — Perfil
+  late final List<Widget> _screens = [
+    MainScreen(
+      onOpenMap: () => _onTabTapped(2),
+      onOpenProfile: () => _onTabTapped(3),
+    ), // 0 — Inicio / Seguridad
+    const SecurityScreen(), // 1 — Seguridad dedicada
+    const MapDashboardScreen(), // 2 — Mapa
+    const AccountConfigScreen(), // 3 — Perfil
   ];
 
   @override
   void initState() {
     super.initState();
     _currentIndex = widget.initialIndex;
-    _initializeSessionServices();
+    _sessionStartedAt = DateTime.now();
+    _activeEmergencyIdAtStart = ProtectionService.shared.activeEmergencyId;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_initializeSessionServices());
+      unawaited(NotificationService().showPendingEmergencySurvey());
+    });
   }
 
   /// Arranca, una sola vez por sesión, los servicios que deben vivir
@@ -43,7 +64,142 @@ class _AppShellState extends State<AppShell> {
   ///   la lógica que tenía vendor_home.dart, una pantalla a la que nunca se
   ///   navegaba y por lo tanto nunca corría.
   Future<void> _initializeSessionServices() async {
+    await LocationService.ensureLocationPermission();
+    if (!mounted) return;
     await NotificationService().initialize();
+    await _restorePendingEmergency();
+  }
+
+  Future<void> _restorePendingEmergency() async {
+    final userId = FirebaseAuth.instance.currentUser?.uid;
+    if (userId == null) return;
+
+    try {
+      final emergency = await FirestoreService().findPendingEmergency(
+        userId,
+        createdBefore: _sessionStartedAt,
+      );
+      if (!mounted) return;
+
+      final protectionService = ProtectionService.shared;
+      if (emergency == null) {
+        if (protectionService.activeEmergencyId != null &&
+            protectionService.activeEmergencyId == _activeEmergencyIdAtStart) {
+          protectionService.clearActiveEmergencyId();
+          protectionService.clearAlarm();
+          protectionService.deactivate();
+        }
+        return;
+      }
+
+      final alreadyActiveInSession = _activeEmergencyIdAtStart == emergency.id;
+      protectionService.markAlarmActive(emergency.id);
+      if (!alreadyActiveInSession ||
+          _shownRecoveryPrompts.contains(emergency.id)) {
+        _scheduleEmergencyTimeout(emergency);
+      }
+
+      if (alreadyActiveInSession &&
+          !_shownRecoveryPrompts.contains(emergency.id)) {
+        return;
+      }
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_shownRecoveryPrompts.add(emergency.id)) return;
+        unawaited(_showRecoveryPrompt(emergency));
+      });
+    } catch (error) {
+      debugPrint('No se pudo recuperar la emergencia pendiente: $error');
+    }
+  }
+
+  void _scheduleEmergencyTimeout(EmergencyModel emergency) {
+    _pendingEmergencyTimeout?.cancel();
+    final expiresAt = emergency.timestamp.add(
+      FirestoreService.emergencyVisibilityDuration,
+    );
+    final remaining = expiresAt.difference(DateTime.now());
+    _pendingEmergencyTimeout = Timer(
+      remaining.isNegative ? Duration.zero : remaining,
+      () => unawaited(_expireRecoveredEmergency(emergency.id)),
+    );
+  }
+
+  Future<void> _showRecoveryPrompt(EmergencyModel emergency) async {
+    if (!mounted) return;
+    final confirmation = await showDialog<bool>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) {
+        _recoveryDialogContext = dialogContext;
+        return AlertDialog(
+          title: const Text('¿Todo estuvo bien?'),
+          content: const Text('La emergencia sigue activa. ¿Quieres cerrarla?'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('No, mantener activa'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Sí, todo bien'),
+            ),
+          ],
+        );
+      },
+    );
+    _recoveryDialogContext = null;
+
+    if (confirmation == true) {
+      await _resolveRecoveredEmergency(emergency.id);
+    }
+  }
+
+  Future<void> _expireRecoveredEmergency(String emergencyId) async {
+    if (ProtectionService.shared.activeEmergencyId != emergencyId) return;
+
+    final resolved = await _resolveRecoveredEmergency(
+      emergencyId,
+      showError: false,
+    );
+    if (!resolved &&
+        ProtectionService.shared.activeEmergencyId == emergencyId) {
+      _pendingEmergencyTimeout = Timer(
+        const Duration(seconds: 30),
+        () => unawaited(_expireRecoveredEmergency(emergencyId)),
+      );
+    }
+
+    final dialogContext = _recoveryDialogContext;
+    if (dialogContext != null && dialogContext.mounted) {
+      Navigator.of(dialogContext).pop(false);
+    }
+  }
+
+  Future<bool> _resolveRecoveredEmergency(
+    String emergencyId, {
+    bool showError = true,
+  }) async {
+    try {
+      await FirestoreService().resolveEmergency(emergencyId);
+      final protectionService = ProtectionService.shared;
+      if (protectionService.activeEmergencyId == emergencyId) {
+        protectionService.clearActiveEmergencyId();
+        protectionService.clearAlarm();
+      }
+      _pendingEmergencyTimeout?.cancel();
+      return true;
+    } catch (error) {
+      if (showError && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No se pudo cerrar la emergencia. Sigue activa.'),
+          ),
+        );
+      }
+      debugPrint('No se pudo cerrar la emergencia recuperada: $error');
+      return false;
+    }
   }
 
   void _onTabTapped(int index) {
@@ -53,6 +209,7 @@ class _AppShellState extends State<AppShell> {
 
   @override
   void dispose() {
+    _pendingEmergencyTimeout?.cancel();
     super.dispose();
   }
 

@@ -1,13 +1,18 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:cloud_functions/cloud_functions.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:just_audio/just_audio.dart';
-
-import 'emergency.dart'; // Importa tu servicio centralizado
-
-import 'package:vibration/vibration.dart';
+import 'package:url_launcher/url_launcher.dart';
 import 'package:areaguardian/services/firestore_service.dart';
-import 'package:areaguardian/services/location_service.dart';
-import 'package:areaguardian/services/protection_service.dart';
+import 'package:areaguardian/services/emergency_alert_service.dart';
+import 'package:areaguardian/services/vendor_foreground_service.dart';
+import 'package:areaguardian/services/app_telemetry_service.dart';
+import 'package:areaguardian/models/emergency_model.dart';
+import 'package:areaguardian/screens/user/shake_training_screen.dart';
+import 'package:areaguardian/utils/helpers.dart';
 
 // ==========================================
 // PANTALLA DEDICADA DE SEGURIDAD (TAB 1)
@@ -22,20 +27,30 @@ class SecurityScreen extends StatefulWidget {
 class _SecurityScreenState extends State<SecurityScreen>
     with TickerProviderStateMixin {
   final ProtectionService _protectionService = ProtectionService.shared;
+  final EmergencyAlertService _emergencyAlertService = EmergencyAlertService();
   String emergencyContact = 'Sin contacto de emergencia';
-  DateTime? _lastAlertTime;
-  String? _activeEmergencyId;
+  EmergencyModel? _activeEmergency;
+  static const int _gracePeriodSeconds = 20;
+  Timer? _gracePeriodTimer;
+  DateTime? _gracePeriodEndsAt;
+  int _graceSecondsRemaining = 0;
+  bool _isCancellingAlarm = false;
+  bool _smsIsSending = false;
+  bool _smsFallbackOpened = false;
+  bool _smsAutoSendStarted = false;
+  bool _smsWasCancelled = false;
+  String? _smsContactName;
+  String? _smsError;
+  Future<void>? _smsDeliveryRequest;
 
-  late AudioPlayer _audioPlayer;
   late AnimationController _pulseCtrl;
   late Animation<double> _pulseAnim;
 
   @override
   void initState() {
     super.initState();
-    _audioPlayer = AudioPlayer();
-    _initAudio();
     _loadContact();
+    unawaited(_restoreActiveEmergency());
     _protectionService.addListener(_onProtectionChanged);
     _protectionService.onEmergencyTriggered = _triggerAlarm;
     _pulseCtrl = AnimationController(
@@ -48,15 +63,6 @@ class _SecurityScreenState extends State<SecurityScreen>
     ).animate(CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
   }
 
-  Future<void> _initAudio() async {
-    try {
-      await _audioPlayer.setAsset('assets/audio/alarm.mp3');
-      await _audioPlayer.setLoopMode(LoopMode.one);
-    } catch (e) {
-      debugPrint('Error audio: $e');
-    }
-  }
-
   Future<void> _loadContact() async {
     final prefs = await SharedPreferences.getInstance();
     setState(() {
@@ -65,76 +71,444 @@ class _SecurityScreenState extends State<SecurityScreen>
     });
   }
 
+  Future<void> _restoreActiveEmergency() async {
+    try {
+      final emergency = await FirestoreService()
+          .fetchCurrentUserActiveEmergency();
+      if (!mounted || emergency == null) return;
+      if (_activeEmergency?.id == emergency.id) return;
+
+      _activeEmergency = emergency;
+      if (!_protectionService.isProtected) {
+        _protectionService.activate(listen: false);
+      }
+      if (_protectionService.activeEmergencyId != emergency.id) {
+        _protectionService.markAlarmActive(emergency.id);
+      }
+      _startGracePeriod(emergency);
+    } catch (error) {
+      debugPrint('No se pudo restaurar la emergencia activa para SMS: $error');
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No se pudo recuperar el envío de SMS pendiente.'),
+          ),
+        );
+      }
+    }
+  }
+
   void _onProtectionChanged() {
     if (mounted) setState(() {});
   }
 
   void _toggleGuardia() {
-    _protectionService.isProtected ? _deactivate() : _activate();
+    if (_protectionService.isProtected) {
+      unawaited(_deactivate());
+    } else {
+      unawaited(_activate());
+    }
   }
 
-  void _activate() {
-    _protectionService.activate();
-  }
-
-  void _deactivate() {
-    _protectionService.deactivate();
-  }
-
-  void _triggerAlarm() async {
-    final prefs = await SharedPreferences.getInstance();
-    final position = await LocationService().getCurrentLocationForEmergency();
-    if (position == null) {
+  Future<void> _activate() async {
+    try {
+      await VendorForegroundService.startGuard();
+      _protectionService.activate();
+      await AppTelemetryService.logGuardActivated();
+    } catch (error) {
+      await VendorForegroundService.stopGuard();
+      debugPrint('No se pudo iniciar la guardia en segundo plano: $error');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text('No se pudo obtener tu ubicación exacta.'),
+            content: Text(
+              'No se pudo iniciar la guardia en segundo plano. Revisa los permisos de notificación.',
+            ),
           ),
         );
       }
+    }
+  }
+
+  Future<void> _deactivate() async {
+    _protectionService.deactivate();
+    await VendorForegroundService.stopGuard();
+  }
+
+  void _triggerAlarm() {
+    if (!mounted || !_protectionService.beginEmergencyActivation()) return;
+    unawaited(_emergencyAlertService.vibrateConfirmation());
+    unawaited(_submitEmergency());
+  }
+
+  Future<void> _submitEmergency() async {
+    var activated = false;
+    try {
+      final hasNetworkTransport = await _hasNetworkTransport();
+      final emergency = await _emergencyAlertService.createEmergency(
+        persist: hasNetworkTransport,
+      );
+      if (emergency == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('No se pudo obtener tu ubicación exacta.'),
+            ),
+          );
+        }
+        return;
+      }
+      _protectionService.markAlarmActive(emergency.id);
+      _activeEmergency = emergency;
+      _smsWasCancelled = false;
+      activated = true;
+      _startGracePeriod(emergency);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              emergency.id.startsWith('offline_')
+                  ? 'Sin internet. El mensaje está listo para que lo envíes.'
+                  : 'Solicitud enviada discretamente.',
+            ),
+          ),
+        );
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('No se pudo enviar la solicitud: $error')),
+        );
+      }
+    } finally {
+      if (!activated) _protectionService.failEmergencyActivation();
+    }
+  }
+
+  void _startGracePeriod(EmergencyModel emergency) {
+    _gracePeriodTimer?.cancel();
+    if (emergency.id.startsWith('offline_')) {
+      _gracePeriodEndsAt = null;
+      _graceSecondsRemaining = 0;
+      _smsAutoSendStarted = true;
+      _smsError = 'Sin internet. Se abrirá la aplicación de mensajes.';
+      _activeEmergency = emergency.copyWithSmsStatus('failed');
+      if (mounted) setState(() {});
+      unawaited(_prepareEmergencySms());
       return;
     }
 
-    final userId =
-        prefs.getString('user_id') ?? prefs.getString('client_id') ?? '';
-    final userName =
-        prefs.getString('user_name') ??
-        prefs.getString('vendor_name') ??
-        'Usuario AreaGuardian';
-    final emergency = await FirestoreService().createEmergency(
-      userId: userId,
-      userName: userName,
-      latitude: position.latitude,
-      longitude: position.longitude,
+    final emergencyCreatedAt = emergency.timestamp;
+    final gracePeriodEndsAt = emergencyCreatedAt.add(
+      const Duration(seconds: _gracePeriodSeconds),
     );
-    _activeEmergencyId = emergency.id;
-    _protectionService.setActiveEmergencyId(emergency.id);
-    _lastAlertTime = DateTime.now();
-
-    if (await Vibration.hasVibrator() ?? false) {
-      await Vibration.vibrate(pattern: [0, 100, 100, 100, 100, 100]);
+    if (!gracePeriodEndsAt.isAfter(DateTime.now())) {
+      _gracePeriodEndsAt = null;
+      _graceSecondsRemaining = 0;
+      unawaited(_sendEmergencySmsAutomatically());
+      return;
     }
-    _protectionService.markAlarmActive();
-    await EmergencyAlertService.sendSMSAlert(context);
-    await _audioPlayer.seek(Duration.zero);
-    await _audioPlayer.play();
+    _gracePeriodEndsAt = gracePeriodEndsAt;
+    _updateGraceCountdown();
+    _gracePeriodTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      _updateGraceCountdown();
+    });
   }
 
-  void _cancelAlarm() async {
-    await _audioPlayer.stop();
-    final emergencyId = _protectionService.activeEmergencyId;
-    if (emergencyId != null) {
-      await FirestoreService().resolveEmergency(emergencyId);
-      _protectionService.clearActiveEmergencyId();
-      _activeEmergencyId = null;
+  void _updateGraceCountdown() {
+    final deadline = _gracePeriodEndsAt;
+    if (deadline == null) return;
+
+    final remainingMilliseconds = deadline
+        .difference(DateTime.now())
+        .inMilliseconds;
+    final remainingSeconds = (remainingMilliseconds / 1000).ceil();
+    final gracePeriodEnded = remainingSeconds <= 0;
+    if (mounted) {
+      setState(() {
+        _graceSecondsRemaining = remainingSeconds.clamp(0, _gracePeriodSeconds);
+        if (gracePeriodEnded) _gracePeriodEndsAt = null;
+      });
     }
-    _protectionService.clearAlarm();
+    if (gracePeriodEnded) {
+      _gracePeriodTimer?.cancel();
+      unawaited(_sendEmergencySmsAutomatically());
+    }
+  }
+
+  bool get _isGracePeriodActive =>
+      _gracePeriodEndsAt?.isAfter(DateTime.now()) ?? false;
+
+  Future<bool> _hasNetworkTransport() async {
+    try {
+      final connectivity = await Connectivity().checkConnectivity().timeout(
+        const Duration(seconds: 2),
+      );
+      return !connectivity.contains(ConnectivityResult.none);
+    } on TimeoutException catch (error) {
+      debugPrint('La comprobación de red agotó el tiempo: $error');
+      return true;
+    } catch (error) {
+      debugPrint('No se pudo comprobar la red: $error');
+      return true;
+    }
+  }
+
+  String get _displayContactName {
+    final savedName = _smsContactName?.trim();
+    if (savedName != null && savedName.isNotEmpty) return savedName;
+    final name = emergencyContact.split('—').first.trim();
+    return name.isNotEmpty ? name : 'tu contacto de emergencia';
+  }
+
+  Future<void> _sendEmergencySmsAutomatically() =>
+      _sendEmergencySms(sendNow: false);
+
+  Future<void> _sendEmergencySms({required bool sendNow}) async {
+    if (_smsAutoSendStarted && !sendNow) return;
+    if (_activeEmergency?.isTest == true) {
+      _smsError = 'Los simulacros no envían SMS.';
+      if (mounted) setState(() {});
+      return;
+    }
+    final existingRequest = _smsDeliveryRequest;
+    if (existingRequest != null) {
+      await existingRequest;
+      return;
+    }
+
+    _smsAutoSendStarted = true;
+    final request = _performEmergencySmsSend(sendNow: sendNow);
+    _smsDeliveryRequest = request;
+    try {
+      await request;
+    } finally {
+      if (identical(_smsDeliveryRequest, request)) {
+        _smsDeliveryRequest = null;
+      }
+    }
+  }
+
+  Future<void> _performEmergencySmsSend({required bool sendNow}) async {
+    final emergency = _activeEmergency;
+    if (emergency == null) return;
+
+    if (mounted) {
+      setState(() {
+        _smsIsSending = true;
+        _smsError = null;
+      });
+    }
+
+    try {
+      final hasInternet = await _hasInternetConnection();
+      if (_smsWasCancelled) return;
+      if (!hasInternet) {
+        _smsError = 'Sin internet. Se abrirá la aplicación de mensajes.';
+        _activeEmergency = emergency.copyWithSmsStatus('failed');
+        unawaited(AppTelemetryService.logSmsFailed());
+        if (mounted) setState(() {});
+        await _prepareEmergencySms();
+        return;
+      }
+
+      final callable =
+          FirebaseFunctions.instanceFor(
+            region: 'southamerica-east1',
+          ).httpsCallable(
+            'sendEmergencySms',
+            options: HttpsCallableOptions(timeout: const Duration(seconds: 10)),
+          );
+      final result = await callable.call({
+        'emergencyId': emergency.id,
+        'sendNow': sendNow,
+      });
+      final response = Map<String, dynamic>.from(result.data as Map);
+      if (response['status'] != 'sent') {
+        throw StateError('La función no confirmó el envío del SMS.');
+      }
+
+      final wasAlreadySent = emergency.smsStatus == 'sent';
+      _activeEmergency = emergency.copyWithSmsStatus('sent');
+      _smsContactName = response['contactName'] as String?;
+      _smsFallbackOpened = false;
+      if (!wasAlreadySent) unawaited(AppTelemetryService.logSmsSent());
+      if (mounted) setState(() {});
+    } catch (error) {
+      debugPrint('No se pudo enviar el SMS automático: $error');
+      if (_smsWasCancelled) return;
+      if (error is FirebaseFunctionsException &&
+          error.code == 'failed-precondition' &&
+          (error.message?.contains('gracia todavía no ha terminado') ??
+              false)) {
+        _smsAutoSendStarted = false;
+        _gracePeriodEndsAt = DateTime.now().add(const Duration(seconds: 1));
+        _graceSecondsRemaining = 1;
+        if (mounted) setState(() {});
+        _gracePeriodTimer?.cancel();
+        _gracePeriodTimer = Timer(
+          const Duration(seconds: 1),
+          _updateGraceCountdown,
+        );
+        return;
+      }
+      try {
+        final serverStatus = await FirestoreService()
+            .fetchEmergencySmsStatus(emergency.id)
+            .timeout(const Duration(seconds: 1));
+        if (serverStatus == 'sent') {
+          _activeEmergency = emergency.copyWithSmsStatus('sent');
+          _smsError = null;
+          if (emergency.smsStatus != 'sent') {
+            unawaited(AppTelemetryService.logSmsSent());
+          }
+          if (mounted) setState(() {});
+          return;
+        }
+      } catch (statusError) {
+        debugPrint('No se pudo comprobar el estado del SMS: $statusError');
+      }
+      _activeEmergency = emergency.copyWithSmsStatus('failed');
+      _smsError =
+          'Falló el envío automático. Se abrirá la aplicación de mensajes.';
+      unawaited(AppTelemetryService.logSmsFailed());
+      if (mounted) setState(() {});
+      await _prepareEmergencySms();
+    } finally {
+      _smsIsSending = false;
+      if (mounted) setState(() {});
+    }
+  }
+
+  Future<bool> _hasInternetConnection() async {
+    final connectivity = await Connectivity().checkConnectivity().timeout(
+      const Duration(seconds: 2),
+    );
+    if (connectivity.contains(ConnectivityResult.none)) return false;
+    try {
+      final addresses = await InternetAddress.lookup('firebase.google.com')
+          .timeout(const Duration(seconds: 2));
+      return addresses.isNotEmpty;
+    } on SocketException catch (error) {
+      debugPrint('No hay conexión de internet para el SMS: $error');
+      return false;
+    } on TimeoutException catch (error) {
+      debugPrint('La comprobación de internet agotó el tiempo: $error');
+      return false;
+    }
+  }
+
+  Future<void> _prepareEmergencySms() async {
+    final emergency = _activeEmergency;
+    if (emergency == null) return;
+
+    final rawContact = emergencyContact.trim();
+    final contactParts = rawContact.split('—');
+    final phone = normalizeColombianMobileNumber(rawContact);
+    if (phone == null) {
+      _showSmsError('Configura un teléfono válido para tu contacto.');
+      return;
+    }
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final contactName =
+          contactParts.length > 1 && contactParts.first.trim().isNotEmpty
+          ? contactParts.first.trim()
+          : 'contacto de emergencia';
+      final userName =
+          prefs.getString('user_name') ??
+          prefs.getString('vendor_name') ??
+          emergency.userName;
+      final address = prefs.getString('vendor_address')?.trim();
+      final locationName = address != null && address.isNotEmpty
+          ? address
+          : emergency.role == 'vendor' && emergency.shopName.trim().isNotEmpty
+          ? emergency.shopName
+          : 'tu ubicación actual';
+      final body =
+          'AreaGuardian: ${_withoutEmoji(userName)} activó una alerta en '
+          '${_withoutEmoji(locationName)}. '
+          'Verifica la situación y llama al 123 si requiere ayuda. Ubicación: '
+          'https://maps.google.com/?q=${emergency.latitude},${emergency.longitude}';
+      _smsContactName = contactName;
+      final smsUri = Uri(
+        scheme: 'sms',
+        path: phone,
+        queryParameters: {'body': body},
+      );
+
+      if (!await launchUrl(smsUri, mode: LaunchMode.externalApplication)) {
+        _smsFallbackOpened = false;
+        _showSmsError('No se pudo abrir la aplicación de mensajes.');
+      } else {
+        _smsFallbackOpened = true;
+        if (mounted) setState(() {});
+      }
+    } catch (error) {
+      _showSmsError('No se pudo preparar el mensaje SMS.');
+      debugPrint('No se pudo abrir el compositor SMS: $error');
+    }
+  }
+
+  String _withoutEmoji(String value) {
+    final textCodePoints = value.runes.where((codePoint) {
+      final isEmojiRange =
+          (codePoint >= 0x1F000 && codePoint <= 0x1FAFF) ||
+          (codePoint >= 0x2600 && codePoint <= 0x27BF) ||
+          (codePoint >= 0x1F1E6 && codePoint <= 0x1F1FF);
+      return !isEmojiRange && codePoint != 0xFE0F && codePoint != 0x200D;
+    });
+    return String.fromCharCodes(textCodePoints)
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+
+  void _showSmsError(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+        .showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  Future<void> _cancelAlarm() async {
+    final emergencyId = _protectionService.activeEmergencyId;
+    if (_isCancellingAlarm) return;
+    _isCancellingAlarm = true;
+    if (mounted) setState(() {});
+
+    try {
+      if (emergencyId != null) {
+        if (_isGracePeriodActive) {
+          await FirestoreService().cancelEmergency(emergencyId);
+        } else {
+          await FirestoreService().resolveEmergency(emergencyId);
+        }
+        _protectionService.clearActiveEmergencyId();
+      }
+      _gracePeriodTimer?.cancel();
+      _gracePeriodEndsAt = null;
+      _smsWasCancelled = true;
+      _protectionService.clearAlarm();
+      await _deactivate();
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('La emergencia sigue activa. Reintenta.'),
+          ),
+        );
+      }
+      debugPrint('No se pudo cerrar la emergencia: $error');
+    } finally {
+      _isCancellingAlarm = false;
+      if (mounted) setState(() {});
+    }
   }
 
   @override
   void dispose() {
     _protectionService.removeListener(_onProtectionChanged);
-    _audioPlayer.dispose();
+    _gracePeriodTimer?.cancel();
     _pulseCtrl.dispose();
     super.dispose();
   }
@@ -166,7 +540,22 @@ class _SecurityScreenState extends State<SecurityScreen>
                     : 'Activa la guardia para comenzar',
                 style: const TextStyle(color: Colors.white54, fontSize: 13),
               ),
-              const SizedBox(height: 40),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: TextButton.icon(
+                  onPressed: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => const ShakeTrainingScreen(),
+                    ),
+                  ),
+                  icon: const Icon(Icons.vibration, size: 18),
+                  label: const Text('PROBAR (sin enviar alerta)'),
+                  style: TextButton.styleFrom(
+                    foregroundColor: const Color(0xFFFFB300),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
               Center(
                 child: ScaleTransition(
                   scale: _pulseAnim,
@@ -286,7 +675,9 @@ class _SecurityScreenState extends State<SecurityScreen>
                       ),
                     ),
                   ),
-                  onPressed: _toggleGuardia,
+                  onPressed: _protectionService.isEmergencyInProgress
+                      ? null
+                      : _toggleGuardia,
                   child: Text(
                     _protectionService.isProtected
                         ? 'DESACTIVAR GUARDIA'
@@ -306,9 +697,21 @@ class _SecurityScreenState extends State<SecurityScreen>
                   width: double.infinity,
                   height: 50,
                   child: OutlinedButton.icon(
-                    onPressed: _triggerAlarm,
-                    icon: const Icon(Icons.warning_amber_rounded),
-                    label: const Text('ACTIVAR EMERGENCIA AHORA'),
+                    onPressed: _protectionService.isEmergencyInProgress
+                        ? null
+                        : _triggerAlarm,
+                    icon: _protectionService.isEmergencyInProgress
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.warning_amber_rounded),
+                    label: Text(
+                      _protectionService.isEmergencyInProgress
+                          ? 'ENVIANDO ALERTA...'
+                          : 'ACTIVAR EMERGENCIA AHORA',
+                    ),
                     style: OutlinedButton.styleFrom(
                       foregroundColor: Colors.redAccent,
                       side: const BorderSide(color: Colors.redAccent),
@@ -364,12 +767,13 @@ class _SecurityScreenState extends State<SecurityScreen>
                 width: double.infinity,
                 padding: const EdgeInsets.symmetric(vertical: 14),
                 decoration: BoxDecoration(
-                  color: Colors.red,
+                  color: const Color(0xFF1D2030),
                   borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: const Color(0xFF00E6A7)),
                 ),
                 child: const Center(
                   child: Text(
-                    '🚨 ALERTA DE EMERGENCIA ACTIVA',
+                    'Solicitud enviada discretamente',
                     style: TextStyle(
                       color: Colors.white,
                       fontWeight: FontWeight.bold,
@@ -384,32 +788,66 @@ class _SecurityScreenState extends State<SecurityScreen>
                 height: 160,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: Colors.red.withOpacity(0.1),
-                  border: Border.all(color: Colors.red, width: 3),
+                  color: Color(0xFF00E6A7).withOpacity(0.08),
+                  border: Border.all(color: Color(0xFF00E6A7), width: 3),
                 ),
                 child: const Center(
                   child: Icon(
                     Icons.warning_amber_rounded,
                     size: 70,
-                    color: Colors.red,
+                    color: Color(0xFF00E6A7),
                   ),
                 ),
               ),
               const SizedBox(height: 20),
               const Text(
-                'EMERGENCIA',
+                'AYUDA SOLICITADA',
                 style: TextStyle(
                   fontSize: 24,
                   fontWeight: FontWeight.bold,
-                  color: Colors.red,
+                  color: Color(0xFF00E6A7),
                   letterSpacing: 2,
                 ),
               ),
               const SizedBox(height: 6),
-              const Text(
-                '¡Toca CANCELAR si fue un error!',
-                style: TextStyle(color: Colors.white60),
-              ),
+              if (_smsIsSending)
+                const Text(
+                  'Enviando SMS de emergencia…',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white70),
+                )
+              else if (_activeEmergency?.smsStatus == 'sent')
+                Text(
+                  '✓ SMS enviado a $_displayContactName',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: Color(0xFF00E6A7),
+                    fontWeight: FontWeight.w600,
+                  ),
+                )
+              else if (_smsFallbackOpened)
+                const Text(
+                  'Se abrió la aplicación de mensajes con el texto listo. '
+                  'Presiona Enviar allí.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white70),
+                )
+              else if (_smsError != null)
+                Text(
+                  _smsError!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.orangeAccent),
+                ),
+              if (_isGracePeriodActive) ...[
+                const SizedBox(height: 12),
+                Text(
+                  'Puedes cancelar la alarma en $_graceSecondsRemaining s',
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
               const Spacer(),
               Container(
                 padding: const EdgeInsets.symmetric(
@@ -428,53 +866,82 @@ class _SecurityScreenState extends State<SecurityScreen>
                       size: 18,
                     ),
                     const SizedBox(width: 10),
-                    Text(
-                      emergencyContact,
-                      style: const TextStyle(color: Colors.white70),
+                    Expanded(
+                      child: Text(
+                        emergencyContact,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(color: Colors.white70),
+                      ),
                     ),
                   ],
                 ),
               ),
               const SizedBox(height: 12),
-              SizedBox(
-                width: double.infinity,
-                height: 48,
-                child: OutlinedButton(
-                  style: OutlinedButton.styleFrom(
-                    side: const BorderSide(color: Colors.white24),
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(12),
+              if (_activeEmergency?.smsStatus == 'sent')
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    onPressed: _prepareEmergencySms,
+                    icon: const Icon(Icons.sms_outlined, size: 18),
+                    label: const Text('Reenviar desde mi celular'),
+                  ),
+                )
+              else if (_isGracePeriodActive && !_smsAutoSendStarted)
+                SizedBox(
+                  width: double.infinity,
+                  height: 48,
+                  child: FilledButton.icon(
+                    onPressed: _smsIsSending
+                        ? null
+                        : () => _sendEmergencySms(sendNow: true),
+                    icon: _smsIsSending
+                        ? const SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        : const Icon(Icons.send_outlined),
+                    label: const Text('Enviar ahora'),
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF00E6A7),
+                      foregroundColor: Colors.black,
                     ),
                   ),
-                  onPressed: () {
-                    _cancelAlarm();
-                    _deactivate();
-                  },
-                  child: const Text(
-                    'DESACTIVAR GUARDIA',
-                    style: TextStyle(
-                      color: Colors.white60,
-                      fontWeight: FontWeight.bold,
-                    ),
+                )
+              else if (!_smsIsSending &&
+                  _smsAutoSendStarted &&
+                  _activeEmergency?.smsStatus != 'sent')
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton.icon(
+                    onPressed: _prepareEmergencySms,
+                    icon: const Icon(Icons.sms_outlined, size: 18),
+                    label: const Text('Abrir mensaje desde mi celular'),
                   ),
                 ),
-              ),
-              const SizedBox(height: 10),
+              if (_isGracePeriodActive || _activeEmergency?.smsStatus == 'sent')
+                const SizedBox(height: 10),
               SizedBox(
                 width: double.infinity,
                 height: 48,
                 child: OutlinedButton(
                   style: OutlinedButton.styleFrom(
-                    side: const BorderSide(color: Colors.red),
+                    side: BorderSide(
+                      color: _isGracePeriodActive ? Colors.red : Colors.white24,
+                    ),
                     shape: RoundedRectangleBorder(
                       borderRadius: BorderRadius.circular(12),
                     ),
                   ),
-                  onPressed: _cancelAlarm,
-                  child: const Text(
-                    '✕  CANCELAR ALARMA — Fue un error',
+                  onPressed: _isCancellingAlarm ? null : _cancelAlarm,
+                  child: Text(
+                    _isCancellingAlarm
+                        ? 'CANCELANDO...'
+                        : _isGracePeriodActive
+                        ? 'CANCELAR ALARMA'
+                        : 'DESACTIVAR GUARDIA',
                     style: TextStyle(
-                      color: Colors.red,
+                      color: _isGracePeriodActive ? Colors.red : Colors.white60,
                       fontWeight: FontWeight.bold,
                     ),
                   ),

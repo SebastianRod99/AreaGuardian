@@ -1,13 +1,20 @@
+import 'dart:async';
+import 'dart:ui' show PlatformDispatcher;
+
 import 'package:flutter/material.dart';
-import 'package:firebase_core/firebase_core.dart'; // 1. Importa Firebase Core
+import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 import 'widgets/bar_nav.dart';
 import 'screens/auth/login.dart';
 import 'screens/auth/register.dart';
 import 'services/notification_service.dart';
+import 'services/session_service.dart';
+import 'services/app_telemetry_service.dart';
+import 'services/consent_service.dart';
+import 'screens/consent_screen.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() async {
   // 2. Se convierte en async
@@ -16,6 +23,18 @@ void main() async {
 
   // 4. Inicializa la conexión con Firebase
   await Firebase.initializeApp();
+  final preferences = await SharedPreferences.getInstance();
+  await AppTelemetryService.initialize(
+    collectionEnabled: preferences.getBool('analytics_consent') ?? false,
+  );
+  FlutterError.onError = (details) {
+    FlutterError.presentError(details);
+    unawaited(AppTelemetryService.recordFatalFlutterError(details));
+  };
+  PlatformDispatcher.instance.onError = (error, stackTrace) {
+    unawaited(AppTelemetryService.recordFatalError(error, stackTrace));
+    return false;
+  };
 
   // 5. Registra el handler de notificaciones FCM en segundo plano.
   // Debe llamarse antes de runApp() y apuntar a una función de nivel
@@ -57,6 +76,8 @@ class _AuthCheckScreenState extends State<AuthCheckScreen> {
   bool _isLoading = true;
   bool _isLoggedIn = false;
   bool _isRegistered = false;
+  bool _needsConsent = false;
+  String? _errorMessage;
 
   @override
   void initState() {
@@ -65,14 +86,28 @@ class _AuthCheckScreenState extends State<AuthCheckScreen> {
   }
 
   Future<void> _checkSession() async {
-    final prefs = await SharedPreferences.getInstance();
     final firebaseUser = FirebaseAuth.instance.currentUser;
-    if (firebaseUser == null) {
-      await prefs.setBool('is_logged_in', false);
+    var isRegistered = false;
+    var needsConsent = false;
+    String? errorMessage;
+    if (firebaseUser != null) {
+      try {
+        isRegistered = await SessionService().restoreSession(firebaseUser);
+        needsConsent = !await ConsentService().hasCurrentConsent(
+          userId: firebaseUser.uid,
+        );
+      } catch (error) {
+        errorMessage = 'No se pudo restaurar tu perfil: $error';
+      }
+    } else {
+      needsConsent = !await ConsentService().hasCurrentConsent();
     }
+    if (!mounted) return;
     setState(() {
       _isLoggedIn = firebaseUser != null;
-      _isRegistered = prefs.getBool('is_registered') ?? false;
+      _isRegistered = isRegistered;
+      _needsConsent = needsConsent;
+      _errorMessage = errorMessage;
       _isLoading = false;
     });
   }
@@ -85,6 +120,37 @@ class _AuthCheckScreenState extends State<AuthCheckScreen> {
           child: CircularProgressIndicator(color: Color(0xFF00E6A7)),
         ),
       );
+    }
+
+    if (_errorMessage != null) {
+      return Scaffold(
+        body: Center(
+          child: Padding(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(_errorMessage!, textAlign: TextAlign.center),
+                const SizedBox(height: 16),
+                ElevatedButton(
+                  onPressed: () {
+                    setState(() {
+                      _isLoading = true;
+                      _errorMessage = null;
+                    });
+                    _checkSession();
+                  },
+                  child: const Text('Reintentar'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (_needsConsent) {
+      return ConsentScreen(onAccepted: _checkSession);
     }
 
     // Logueado y registrado → Shell con nav bar

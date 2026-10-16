@@ -11,6 +11,9 @@ class VendorModel {
   // Ubicación Fija / Comercial del Puesto
   final double latitude;
   final double longitude;
+  final double? currentLatitude;
+  final double? currentLongitude;
+  final DateTime? lastLocationUpdate;
 
   final String nequiNumber;
   final String daviplataNumber;
@@ -31,6 +34,9 @@ class VendorModel {
     required this.category,
     required this.latitude,
     required this.longitude,
+    this.currentLatitude,
+    this.currentLongitude,
+    this.lastLocationUpdate,
     required this.nequiNumber,
     required this.daviplataNumber,
     this.llaveNumber = '',
@@ -39,6 +45,9 @@ class VendorModel {
     this.lastSeen,
     this.fcmToken,
   });
+
+  double get fixedLatitude => latitude;
+  double get fixedLongitude => longitude;
 
   Map<String, dynamic> toJson() {
     return {
@@ -50,6 +59,10 @@ class VendorModel {
       'category': category,
       'latitude': latitude,
       'longitude': longitude,
+      if (currentLatitude != null) 'currentLatitude': currentLatitude,
+      if (currentLongitude != null) 'currentLongitude': currentLongitude,
+      if (lastLocationUpdate != null)
+        'lastLocationUpdate': lastLocationUpdate!.toIso8601String(),
       'nequiNumber': nequiNumber,
       'daviplataNumber': daviplataNumber,
       'llaveNumber': llaveNumber,
@@ -70,6 +83,9 @@ class VendorModel {
       category: json['category'] ?? '',
       latitude: (json['latitude'] as num?)?.toDouble() ?? 0.0,
       longitude: (json['longitude'] as num?)?.toDouble() ?? 0.0,
+      currentLatitude: (json['currentLatitude'] as num?)?.toDouble(),
+      currentLongitude: (json['currentLongitude'] as num?)?.toDouble(),
+      lastLocationUpdate: _parseLastSeen(json['lastLocationUpdate']),
       nequiNumber: json['nequiNumber'] ?? '',
       daviplataNumber: json['daviplataNumber'] ?? '',
       llaveNumber: json['llaveNumber'] ?? '',
@@ -99,6 +115,9 @@ class VendorModel {
     String? vendorName,
     double? latitude,
     double? longitude,
+    double? currentLatitude,
+    double? currentLongitude,
+    DateTime? lastLocationUpdate,
     bool? isActive,
     DateTime? lastSeen,
     String? fcmToken,
@@ -116,6 +135,9 @@ class VendorModel {
       category: category,
       latitude: latitude ?? this.latitude,
       longitude: longitude ?? this.longitude,
+      currentLatitude: currentLatitude ?? this.currentLatitude,
+      currentLongitude: currentLongitude ?? this.currentLongitude,
+      lastLocationUpdate: lastLocationUpdate ?? this.lastLocationUpdate,
       nequiNumber: nequiNumber ?? this.nequiNumber,
       daviplataNumber: daviplataNumber ?? this.daviplataNumber,
       llaveNumber: llaveNumber ?? this.llaveNumber,
