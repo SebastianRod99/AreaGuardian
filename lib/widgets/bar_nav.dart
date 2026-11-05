@@ -2,7 +2,6 @@ import 'dart:async';
 
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 import 'package:areaguardian/models/emergency_model.dart';
 import 'package:areaguardian/screens//user/home.dart';
 import 'package:areaguardian/screens/map_dashboard_screen.dart';
@@ -40,7 +39,6 @@ class _AppShellState extends State<AppShell> {
       onOpenProfile: () => _onTabTapped(3),
     ), // 0 — Inicio / Seguridad
     const SecurityScreen(), // 1 — Seguridad dedicada
-    const MapDashboardScreen(), // 2 — Mapa
     const AccountConfigScreen(), // 3 — Perfil
   ];
 
@@ -218,7 +216,15 @@ class _AppShellState extends State<AppShell> {
     return Scaffold(
       backgroundColor: const Color(0xFF121420),
       // IndexedStack mantiene el estado de cada pantalla al cambiar de tab
-      body: IndexedStack(index: _currentIndex, children: _screens),
+      body: IndexedStack(
+        index: _currentIndex,
+        children: [
+          _screens[0],
+          _screens[1],
+          MapDashboardScreen(isVisible: _currentIndex == 2),
+          _screens[2],
+        ],
+      ),
       bottomNavigationBar: Container(
         decoration: BoxDecoration(
           color: const Color(0xFF1D2030),

@@ -23,6 +23,8 @@ import '../utils/geo_utils.dart';
 // PANTALLA DE MAPA — OpenStreetMap + Firestore
 // ==========================================
 class MapDashboardScreen extends StatefulWidget {
+  final bool isVisible;
+
   /// Si vienen de una notificación de emergencia (HU-05), el mapa se centra
   /// aquí y se pinta un marcador de alerta en ese punto.
   final double? focusLatitude;
@@ -31,6 +33,7 @@ class MapDashboardScreen extends StatefulWidget {
 
   const MapDashboardScreen({
     super.key,
+    this.isVisible = true,
     this.focusLatitude,
     this.focusLongitude,
     this.focusSourceLabel,
@@ -48,6 +51,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   final AudioPlayer _emergencyPlayer = AudioPlayer();
   final Geocoding _geocoding = Geocoding();
   StreamSubscription<Position>? _userPositionSubscription;
+  StreamSubscription<User?>? _authSubscription;
 
   // Ubicación EN VIVO del usuario actual (dueño o cliente) — centra el mapa
   // y, si el rol es cliente, es también su propio marcador (HU-06).
@@ -74,7 +78,18 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   String _vendorId = '';
   String _userId = '';
   LatLng? _emergencyQueryCenter;
+  LatLng? _emergencyPendingCenter;
   int _emergencyQueryGeneration = 0;
+  int _emergencyRetryAttempt = 0;
+  bool _emergencyWatchFailed = false;
+  bool _showEmergencyQueryWarning = false;
+  Timer? _emergencyRetryTimer;
+
+  static const List<Duration> _emergencyRetryDelays = [
+    Duration(seconds: 2),
+    Duration(seconds: 5),
+    Duration(seconds: 15),
+  ];
 
   // Lista de puestos dinámicos obtenidos desde Firebase Firestore
   List<VendorModel> _puestosVecinos = [];
@@ -88,10 +103,52 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   @override
   void initState() {
     super.initState();
+    _authSubscription = FirebaseAuth.instance.authStateChanges().listen(
+      _handleAuthState,
+      onError: (Object error) {
+        _logEmergencyQueryError('esperar la sesión autenticada', error);
+      },
+    );
     _loadMyPuestoAndLocation();
     _emergencyExpiryTimer = Timer.periodic(
       const Duration(seconds: 30),
       (_) => _removeExpiredEmergencies(),
+    );
+  }
+
+  void _handleAuthState(User? user) {
+    if (!mounted) return;
+    final nextUserId = user?.uid ?? '';
+    if (_userId == nextUserId) return;
+
+    _userId = nextUserId;
+    _emergencyQueryGeneration++;
+    _emergencyRetryTimer?.cancel();
+    _emergencySubscription?.cancel();
+    _emergencySubscription = null;
+    _emergencyPendingCenter = null;
+    _emergencyQueryCenter = null;
+    _emergencyRetryAttempt = 0;
+    _emergencyWatchFailed = false;
+    if (nextUserId.isEmpty) {
+      setState(() {
+        _emergencies = [];
+        _showEmergencyQueryWarning = false;
+      });
+      unawaited(_stopEmergencyAlarm());
+      return;
+    }
+
+    if (_myLocation case final location?) {
+      _requestEmergencyRefresh(location);
+    }
+  }
+
+  void _logEmergencyQueryError(String operation, Object error) {
+    final code = error is FirebaseException ? error.code : 'n/a';
+    debugPrint(
+      'Emergency $operation failed: '
+      'type=${error.runtimeType}, code=$code, error=$error',
     );
   }
 
@@ -106,41 +163,6 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
           .toList();
     });
     _syncEmergencyAlarm();
-  }
-
-  void _watchActiveEmergencies({required LatLng center}) {
-    _emergencySubscription?.cancel();
-    if (_userId.isEmpty) {
-      setState(() => _emergencies = []);
-      unawaited(_stopEmergencyAlarm());
-      return;
-    }
-    _emergencySubscription = _firestoreService
-        .watchActiveEmergencies(
-          latitude: center.latitude,
-          longitude: center.longitude,
-        )
-        .listen(
-          (emergencies) {
-            if (!mounted) return;
-            setState(
-              () => _emergencies = _filterEmergenciesAtCurrentLocation(
-                emergencies,
-              ),
-            );
-            _syncEmergencyAlarm();
-          },
-          onError: (Object error) {
-            debugPrint('No se pudieron actualizar emergencias cercanas: $error');
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text('No se pudieron actualizar alertas cercanas.'),
-                ),
-              );
-            }
-          },
-        );
   }
 
   bool _isOwnEmergency(EmergencyModel emergency) {
@@ -270,10 +292,6 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       setState(() {
         _isVendorRole = (prefs.getString('user_role') ?? '') == 'vendor';
         _vendorId = prefs.getString('vendor_id') ?? '';
-        _userId =
-            FirebaseAuth.instance.currentUser?.uid ??
-            prefs.getString('user_id') ??
-            '';
         _myPuestoTitle = prefs.getString('puesto_title') ?? 'Mi Puesto';
         _myAddress = prefs.getString('vendor_address') ?? '';
         _isEmergencyAlarmMuted =
@@ -354,9 +372,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     _centerMapOnLocation(location);
     _syncEmergencyAlarm();
     unawaited(_updateLocationNames(location));
-    if (FirebaseAuth.instance.currentUser != null) {
-      unawaited(_loadEmergenciesAtLocation(location));
-    }
+    _requestEmergencyRefresh(location);
   }
 
   void _centerMapOnLocation(LatLng location) {
@@ -371,40 +387,126 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     _mapController.move(location, 17);
   }
 
-  Future<void> _loadEmergenciesAtLocation(LatLng location) async {
+  void _requestEmergencyRefresh(LatLng location) {
+    if (_userId.isEmpty) return;
+
+    final previousCenter = _emergencyPendingCenter ?? _emergencyQueryCenter;
+    if (previousCenter != null &&
+        Geolocator.distanceBetween(
+              previousCenter.latitude,
+              previousCenter.longitude,
+              location.latitude,
+              location.longitude,
+            ) <
+            150) {
+      return;
+    }
+
     final generation = ++_emergencyQueryGeneration;
+    _emergencyRetryTimer?.cancel();
+    _emergencySubscription?.cancel();
+    _emergencySubscription = null;
+    _emergencyPendingCenter = location;
+    _emergencyRetryAttempt = 0;
+    _emergencyWatchFailed = false;
+    unawaited(_runEmergencyQuery(location, generation));
+  }
+
+  Future<void> _runEmergencyQuery(LatLng location, int generation) async {
     try {
+      if (_userId.isEmpty ||
+          FirebaseAuth.instance.currentUser?.uid != _userId) {
+        return;
+      }
       await _firestoreService.updateUserCurrentLocation(
         latitude: location.latitude,
         longitude: location.longitude,
       );
-      _emergencyQueryCenter = location;
     } catch (error) {
-      debugPrint('No se pudo actualizar la ubicación de consulta: $error');
+      if (!mounted || generation != _emergencyQueryGeneration) return;
+      _logEmergencyQueryError('actualizar ubicación para alertas', error);
+      _scheduleEmergencyQueryRetry(location, generation);
+      return;
     }
 
-    var emergencies = <EmergencyModel>[];
+    List<EmergencyModel> emergencies;
     try {
       emergencies = await _firestoreService.fetchActiveEmergencies(
         latitude: location.latitude,
         longitude: location.longitude,
       );
-    } catch (error) {
-      debugPrint('No se pudieron cargar emergencias cercanas: $error');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('No se pudieron cargar alertas cercanas.'),
-          ),
-        );
-      }
+    } catch (_) {
+      if (!mounted || generation != _emergencyQueryGeneration) return;
+      _scheduleEmergencyQueryRetry(location, generation);
+      return;
     }
 
-    if (!mounted || generation != _emergencyQueryGeneration) return;
-    setState(
-      () => _emergencies = _filterEmergenciesAtCurrentLocation(emergencies),
+    try {
+      if (!mounted || generation != _emergencyQueryGeneration) return;
+
+      _emergencyQueryCenter = location;
+      _emergencyPendingCenter = null;
+      if (!_emergencyWatchFailed) _emergencyRetryAttempt = 0;
+      setState(() {
+        _emergencies = _filterEmergenciesAtCurrentLocation(emergencies);
+        _showEmergencyQueryWarning = false;
+      });
+      _syncEmergencyAlarm();
+
+      _emergencySubscription = _firestoreService
+          .watchActiveEmergencies(
+            latitude: location.latitude,
+            longitude: location.longitude,
+          )
+          .listen(
+            (activeEmergencies) {
+              if (!mounted || generation != _emergencyQueryGeneration) return;
+              _emergencyRetryAttempt = 0;
+              _emergencyWatchFailed = false;
+              _emergencyRetryTimer?.cancel();
+              setState(() {
+                _emergencies = _filterEmergenciesAtCurrentLocation(
+                  activeEmergencies,
+                );
+                _showEmergencyQueryWarning = false;
+              });
+              _syncEmergencyAlarm();
+            },
+            onError: (Object error, StackTrace stackTrace) {
+              if (!mounted || generation != _emergencyQueryGeneration) return;
+              _logEmergencyQueryError('watchActiveEmergencies', error);
+              _emergencyWatchFailed = true;
+              unawaited(_emergencySubscription?.cancel());
+              _emergencySubscription = null;
+              _scheduleEmergencyQueryRetry(location, generation);
+            },
+          );
+    } catch (error) {
+      if (!mounted || generation != _emergencyQueryGeneration) return;
+      _logEmergencyQueryError('watchActiveEmergencies', error);
+      _scheduleEmergencyQueryRetry(location, generation);
+    }
+  }
+
+  void _scheduleEmergencyQueryRetry(LatLng location, int generation) {
+    if (_emergencyRetryAttempt < _emergencyRetryDelays.length) {
+      final delay = _emergencyRetryDelays[_emergencyRetryAttempt++];
+      _emergencyRetryTimer?.cancel();
+      _emergencyRetryTimer = Timer(
+        delay,
+        () => unawaited(_runEmergencyQuery(location, generation)),
+      );
+      return;
+    }
+
+    if (!_showEmergencyQueryWarning) {
+      setState(() => _showEmergencyQueryWarning = true);
+    }
+    _emergencyRetryTimer?.cancel();
+    _emergencyRetryTimer = Timer(
+      _emergencyRetryDelays.last,
+      () => unawaited(_runEmergencyQuery(location, generation)),
     );
-    _watchActiveEmergencies(center: location);
   }
 
   void _watchUserLocation() {
@@ -425,16 +527,16 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
             _syncEmergencyAlarm();
             unawaited(_updateLocationNames(location));
             final queryCenter = _emergencyQueryCenter;
-            if (FirebaseAuth.instance.currentUser != null &&
+            if (_userId.isNotEmpty &&
                 (queryCenter == null ||
-                Geolocator.distanceBetween(
-                      queryCenter.latitude,
-                      queryCenter.longitude,
-                      location.latitude,
-                      location.longitude,
-                    ) >=
-                    150)) {
-              unawaited(_refreshNearbyEmergencies(location));
+                    Geolocator.distanceBetween(
+                          queryCenter.latitude,
+                          queryCenter.longitude,
+                          location.latitude,
+                          location.longitude,
+                        ) >=
+                        150)) {
+              _requestEmergencyRefresh(location);
             }
           },
           onError: (Object error) {
@@ -444,36 +546,6 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
             }
           },
         );
-  }
-
-  Future<void> _refreshNearbyEmergencies(LatLng location) async {
-    final generation = ++_emergencyQueryGeneration;
-    try {
-      await _firestoreService.updateUserCurrentLocation(
-        latitude: location.latitude,
-        longitude: location.longitude,
-      );
-      final emergencies = await _firestoreService.fetchActiveEmergencies(
-        latitude: location.latitude,
-        longitude: location.longitude,
-      );
-      if (!mounted || generation != _emergencyQueryGeneration) return;
-      _emergencyQueryCenter = location;
-      setState(
-        () => _emergencies = _filterEmergenciesAtCurrentLocation(emergencies),
-      );
-      _watchActiveEmergencies(center: location);
-      _syncEmergencyAlarm();
-    } catch (error) {
-      debugPrint('No se pudieron renovar emergencias de la zona: $error');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('No se pudieron actualizar alertas de tu zona.'),
-          ),
-        );
-      }
-    }
   }
 
   Future<void> _updateLocationNames(LatLng location) async {
@@ -546,8 +618,10 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   @override
   void dispose() {
     _userPositionSubscription?.cancel();
+    _authSubscription?.cancel();
     _vendorSubscription?.cancel();
     _emergencySubscription?.cancel();
+    _emergencyRetryTimer?.cancel();
     _emergencyExpiryTimer?.cancel();
     _emergencyPlayer.dispose();
     super.dispose();
@@ -557,6 +631,30 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     if (_myLocation != null) {
       _mapController.move(_myLocation!, 17);
     }
+  }
+
+  Widget _buildEmergencyQueryWarning() {
+    return Material(
+      color: const Color(0xFF2B2630),
+      borderRadius: BorderRadius.circular(10),
+      elevation: 4,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: const [
+            Icon(Icons.cloud_off, size: 17, color: Colors.white70),
+            SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                'No se pudieron actualizar las alertas. Reintentando...',
+                style: TextStyle(color: Colors.white, fontSize: 12),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   void _selectVecino(VendorModel puesto) {
@@ -609,6 +707,13 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
                   _buildCenterButton(),
                   if (showingEmergency || _emergencies.isNotEmpty)
                     _buildEmergencyBanner(),
+                  if (widget.isVisible && _showEmergencyQueryWarning)
+                    Positioned(
+                      top: 12,
+                      left: 12,
+                      right: 12,
+                      child: _buildEmergencyQueryWarning(),
+                    ),
                   if ((_locationDenied || _locationPermissionPending) &&
                       !showingEmergency)
                     _buildLocationWarning(),
@@ -656,47 +761,50 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
           const SizedBox(width: 8),
           if (_neighborhood != null)
             Container(
-            constraints: const BoxConstraints(maxWidth: 130),
-            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1D2030),
-              borderRadius: BorderRadius.circular(10),
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(
-                  Icons.location_city,
-                  color: Color(0xFF00E6A7),
-                  size: 14,
-                ),
-                const SizedBox(width: 6),
-                Flexible(
-                  child: Text(
-                    _neighborhood!,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(color: Colors.white70, fontSize: 12),
-                    ),
-                ),
-                if (_isVendorRole)
-                IconButton(
-                  tooltip: _isEmergencyAlarmMuted
-                      ? 'Activar sonido de alarmas'
-                      : 'Silenciar alarmas',
-                  onPressed: _toggleEmergencyAlarmMute,
-                  icon: Icon(
-                    _isEmergencyAlarmMuted
-                        ? Icons.notifications_off_outlined
-                        : Icons.notifications_active_outlined,
-                    color: _isEmergencyAlarmMuted
-                        ? Colors.white54
-                        : const Color(0xFFFFB300),
+              constraints: const BoxConstraints(maxWidth: 130),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1D2030),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(
+                    Icons.location_city,
+                    color: Color(0xFF00E6A7),
+                    size: 14,
                   ),
-                ),
-              ],
+                  const SizedBox(width: 6),
+                  Flexible(
+                    child: Text(
+                      _neighborhood!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                  if (_isVendorRole)
+                    IconButton(
+                      tooltip: _isEmergencyAlarmMuted
+                          ? 'Activar sonido de alarmas'
+                          : 'Silenciar alarmas',
+                      onPressed: _toggleEmergencyAlarmMute,
+                      icon: Icon(
+                        _isEmergencyAlarmMuted
+                            ? Icons.notifications_off_outlined
+                            : Icons.notifications_active_outlined,
+                        color: _isEmergencyAlarmMuted
+                            ? Colors.white54
+                            : const Color(0xFFFFB300),
+                      ),
+                    ),
+                ],
+              ),
             ),
-          ),
         ],
       ),
     );

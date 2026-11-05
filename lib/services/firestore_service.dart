@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+
 import 'dart:math' as math;
 
 import '../models/vendor_model.dart';
@@ -328,7 +329,10 @@ class FirestoreService {
     required double longitude,
   }) async {
     try {
-      final snapshot = await _nearbyEmergencyQuery(latitude, longitude).get();
+      final snapshot = await _nearbyEmergencyQuery(
+        latitude,
+        longitude,
+      ).get(const GetOptions(source: Source.server));
       return snapshot.docs
           .map((doc) {
             final data = doc.data();
@@ -342,7 +346,11 @@ class FirestoreService {
           )
           .toList();
     } catch (error) {
-      debugPrint('Error al consultar emergencias cercanas: $error');
+      final code = error is FirebaseException ? error.code : 'n/a';
+      debugPrint(
+        'Emergency fetchActiveEmergencies failed: '
+        'type=${error.runtimeType}, code=$code, error=$error',
+      );
       rethrow;
     }
   }
@@ -390,22 +398,20 @@ class FirestoreService {
     required double latitude,
     required double longitude,
   }) {
-    return _nearbyEmergencyQuery(latitude, longitude)
-        .snapshots()
-        .map(
-          (snapshot) => snapshot.docs
-              .map((doc) {
-                final data = doc.data();
-                data['id'] = data['id'] ?? doc.id;
-                return EmergencyModel.fromJson(data);
-              })
-              .where(
-                (emergency) =>
-                    _isVisibleEmergency(emergency) &&
-                    _isWithinEmergencyRadius(emergency, latitude, longitude),
-              )
-              .toList(),
-        );
+    return _nearbyEmergencyQuery(latitude, longitude).snapshots().map(
+      (snapshot) => snapshot.docs
+          .map((doc) {
+            final data = doc.data();
+            data['id'] = data['id'] ?? doc.id;
+            return EmergencyModel.fromJson(data);
+          })
+          .where(
+            (emergency) =>
+                _isVisibleEmergency(emergency) &&
+                _isWithinEmergencyRadius(emergency, latitude, longitude),
+          )
+          .toList(),
+    );
   }
 
   Query<Map<String, dynamic>> _nearbyEmergencyQuery(
@@ -549,30 +555,31 @@ class FirestoreService {
         .collection('emergencies')
         .where('userId', isEqualTo: userId)
         .get();
-    final pendingSurveys = snapshot.docs.where((doc) {
-      final emergency = doc.data();
-      final timestamp = emergency['timestamp'];
-      final createdAt = timestamp is Timestamp ? timestamp.toDate() : null;
-      final resolvedAt = emergency['resolvedAt'];
-      final cancelledAt = resolvedAt is Timestamp
-          ? resolvedAt.toDate()
-          : null;
-      final surveyStatus = emergency['surveyNotificationStatus'];
-      return emergency['isTest'] != true &&
-          !_wasCancelledDuringGrace(
-            status: emergency['status'],
-            createdAt: createdAt,
-            cancelledAt: cancelledAt,
-          ) &&
-          emergency['surveyFeedback'] == null &&
-          (surveyStatus == 'pending' || surveyStatus == 'failed') &&
-          createdAt != null &&
-          !createdAt.isAfter(cutoff);
-    }).toList()..sort((a, b) {
-      final timestampA = a.data()['timestamp'] as Timestamp;
-      final timestampB = b.data()['timestamp'] as Timestamp;
-      return timestampA.compareTo(timestampB);
-    });
+    final pendingSurveys =
+        snapshot.docs.where((doc) {
+          final emergency = doc.data();
+          final timestamp = emergency['timestamp'];
+          final createdAt = timestamp is Timestamp ? timestamp.toDate() : null;
+          final resolvedAt = emergency['resolvedAt'];
+          final cancelledAt = resolvedAt is Timestamp
+              ? resolvedAt.toDate()
+              : null;
+          final surveyStatus = emergency['surveyNotificationStatus'];
+          return emergency['isTest'] != true &&
+              !_wasCancelledDuringGrace(
+                status: emergency['status'],
+                createdAt: createdAt,
+                cancelledAt: cancelledAt,
+              ) &&
+              emergency['surveyFeedback'] == null &&
+              (surveyStatus == 'pending' || surveyStatus == 'failed') &&
+              createdAt != null &&
+              !createdAt.isAfter(cutoff);
+        }).toList()..sort((a, b) {
+          final timestampA = a.data()['timestamp'] as Timestamp;
+          final timestampB = b.data()['timestamp'] as Timestamp;
+          return timestampA.compareTo(timestampB);
+        });
     return pendingSurveys.isEmpty ? null : pendingSurveys.first.id;
   }
 
@@ -580,19 +587,14 @@ class FirestoreService {
     final user = FirebaseAuth.instance.currentUser;
     if (user == null) return false;
 
-    final snapshot = await _db
-        .collection('emergencies')
-        .doc(emergencyId)
-        .get();
+    final snapshot = await _db.collection('emergencies').doc(emergencyId).get();
     if (!snapshot.exists) return false;
 
     final emergency = snapshot.data()!;
     final timestamp = emergency['timestamp'];
     final createdAt = timestamp is Timestamp ? timestamp.toDate() : null;
     final resolvedAt = emergency['resolvedAt'];
-    final cancelledAt = resolvedAt is Timestamp
-        ? resolvedAt.toDate()
-        : null;
+    final cancelledAt = resolvedAt is Timestamp ? resolvedAt.toDate() : null;
     return emergency['userId'] == user.uid &&
         emergency['isTest'] != true &&
         !_wasCancelledDuringGrace(
@@ -602,9 +604,7 @@ class FirestoreService {
         ) &&
         emergency['surveyFeedback'] == null &&
         createdAt != null &&
-        !createdAt
-            .add(_emergencySurveyDelay)
-            .isAfter(DateTime.now());
+        !createdAt.add(_emergencySurveyDelay).isAfter(DateTime.now());
   }
 
   bool _wasCancelledDuringGrace({
@@ -615,9 +615,7 @@ class FirestoreService {
     return status == 'cancelled' &&
         createdAt != null &&
         cancelledAt != null &&
-        !cancelledAt.isAfter(
-          createdAt.add(_emergencyCancellationGrace),
-        );
+        !cancelledAt.isAfter(createdAt.add(_emergencyCancellationGrace));
   }
 
   Future<void> resolveEmergency(String emergencyId) async {
