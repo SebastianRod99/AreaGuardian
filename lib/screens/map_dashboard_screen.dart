@@ -81,7 +81,6 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   LatLng? _emergencyPendingCenter;
   int _emergencyQueryGeneration = 0;
   int _emergencyRetryAttempt = 0;
-  bool _emergencyWatchFailed = false;
   bool _showEmergencyQueryWarning = false;
   Timer? _emergencyRetryTimer;
 
@@ -129,7 +128,6 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     _emergencyPendingCenter = null;
     _emergencyQueryCenter = null;
     _emergencyRetryAttempt = 0;
-    _emergencyWatchFailed = false;
     if (nextUserId.isEmpty) {
       setState(() {
         _emergencies = [];
@@ -139,9 +137,26 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       return;
     }
 
-    if (_myLocation case final location?) {
+    final location = _emergencyMonitoringLocation;
+    if (location != null) {
       _requestEmergencyRefresh(location);
     }
+  }
+
+  LatLng? get _emergencyMonitoringLocation {
+    final location =
+        _myLocation ?? (_isVendorRole ? _myPuestoLocation : null);
+    if (location == null ||
+        !location.latitude.isFinite ||
+        !location.longitude.isFinite ||
+        (location.latitude == 0 && location.longitude == 0) ||
+        location.latitude < -90 ||
+        location.latitude > 90 ||
+        location.longitude < -180 ||
+        location.longitude > 180) {
+      return null;
+    }
+    return location;
   }
 
   void _logEmergencyQueryError(String operation, Object error) {
@@ -196,7 +211,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     final myVendor = _puestosVecinos
         .where((vendor) => vendor.id == _vendorId)
         .firstOrNull;
-    final location = _myLocation;
+    final location = _emergencyMonitoringLocation;
     if (_isEmergencyAlarmMuted ||
         !_isVendorRole ||
         myVendor?.isActive != true ||
@@ -226,7 +241,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   List<EmergencyModel> _filterEmergenciesAtCurrentLocation(
     List<EmergencyModel> emergencies,
   ) {
-    final location = _myLocation;
+    final location = _emergencyMonitoringLocation;
     if (location == null) return [];
     return emergencies
         .where(
@@ -308,6 +323,10 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       setState(() {
         _myPuestoLocation = fixedPuestoLatLng;
       });
+      final monitoringLocation = _emergencyMonitoringLocation;
+      if (_userId.isNotEmpty && monitoringLocation != null) {
+        _requestEmergencyRefresh(monitoringLocation);
+      }
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) unawaited(_loadLocation());
       });
@@ -335,9 +354,10 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     });
     debugPrint('Map location permission resolved: $permission');
     if (!hasPermission) {
-      _emergencyQueryCenter = null;
-      _emergencySubscription?.cancel();
-      setState(() => _emergencies = []);
+      final fallbackLocation = _emergencyMonitoringLocation;
+      if (_userId.isNotEmpty && fallbackLocation != null) {
+        _requestEmergencyRefresh(fallbackLocation);
+      }
       return;
     }
 
@@ -408,74 +428,47 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     _emergencySubscription = null;
     _emergencyPendingCenter = location;
     _emergencyRetryAttempt = 0;
-    _emergencyWatchFailed = false;
-    unawaited(_runEmergencyQuery(location, generation));
+    _runEmergencyQuery(location, generation);
   }
 
-  Future<void> _runEmergencyQuery(LatLng location, int generation) async {
-    try {
-      if (_userId.isEmpty ||
-          FirebaseAuth.instance.currentUser?.uid != _userId) {
-        return;
-      }
-      await _firestoreService.updateUserCurrentLocation(
-        latitude: location.latitude,
-        longitude: location.longitude,
-      );
-    } catch (error) {
-      if (!mounted || generation != _emergencyQueryGeneration) return;
-      _logEmergencyQueryError('actualizar ubicación para alertas', error);
-      _scheduleEmergencyQueryRetry(location, generation);
+  void _runEmergencyQuery(LatLng location, int generation) {
+    if (!mounted ||
+        generation != _emergencyQueryGeneration ||
+        _userId.isEmpty ||
+        FirebaseAuth.instance.currentUser?.uid != _userId) {
       return;
     }
 
-    List<EmergencyModel> emergencies;
+    unawaited(_emergencySubscription?.cancel());
+    _emergencySubscription = null;
+    _emergencyQueryCenter = location;
+    _emergencyPendingCenter = null;
     try {
-      emergencies = await _firestoreService.fetchActiveEmergencies(
-        latitude: location.latitude,
-        longitude: location.longitude,
-      );
-    } catch (_) {
-      if (!mounted || generation != _emergencyQueryGeneration) return;
-      _scheduleEmergencyQueryRetry(location, generation);
-      return;
-    }
-
-    try {
-      if (!mounted || generation != _emergencyQueryGeneration) return;
-
-      _emergencyQueryCenter = location;
-      _emergencyPendingCenter = null;
-      if (!_emergencyWatchFailed) _emergencyRetryAttempt = 0;
-      setState(() {
-        _emergencies = _filterEmergenciesAtCurrentLocation(emergencies);
-        _showEmergencyQueryWarning = false;
-      });
-      _syncEmergencyAlarm();
-
       _emergencySubscription = _firestoreService
           .watchActiveEmergencies(
             latitude: location.latitude,
             longitude: location.longitude,
           )
           .listen(
-            (activeEmergencies) {
+            (snapshot) {
               if (!mounted || generation != _emergencyQueryGeneration) return;
-              _emergencyRetryAttempt = 0;
-              _emergencyWatchFailed = false;
-              _emergencyRetryTimer?.cancel();
+              if (!snapshot.isFromCache) {
+                _emergencyRetryAttempt = 0;
+                _emergencyRetryTimer?.cancel();
+              }
               setState(() {
                 _emergencies = _filterEmergenciesAtCurrentLocation(
-                  activeEmergencies,
+                  snapshot.emergencies,
                 );
-                _showEmergencyQueryWarning = false;
+                if (!snapshot.isFromCache) {
+                  _showEmergencyQueryWarning = false;
+                }
               });
               _syncEmergencyAlarm();
             },
             onError: (Object error, StackTrace stackTrace) {
               if (!mounted || generation != _emergencyQueryGeneration) return;
               _logEmergencyQueryError('watchActiveEmergencies', error);
-              _emergencyWatchFailed = true;
               unawaited(_emergencySubscription?.cancel());
               _emergencySubscription = null;
               _scheduleEmergencyQueryRetry(location, generation);
@@ -485,16 +478,46 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       if (!mounted || generation != _emergencyQueryGeneration) return;
       _logEmergencyQueryError('watchActiveEmergencies', error);
       _scheduleEmergencyQueryRetry(location, generation);
+      return;
+    }
+
+    unawaited(_updateEmergencyQueryLocation(location, generation));
+  }
+
+  Future<void> _updateEmergencyQueryLocation(
+    LatLng location,
+    int generation,
+  ) async {
+    if (!mounted ||
+        generation != _emergencyQueryGeneration ||
+        FirebaseAuth.instance.currentUser?.uid != _userId) {
+      return;
+    }
+
+    try {
+      await _firestoreService.updateUserCurrentLocation(
+        latitude: location.latitude,
+        longitude: location.longitude,
+      );
+    } catch (error) {
+      if (!mounted || generation != _emergencyQueryGeneration) return;
+      _logEmergencyQueryError('actualizar ubicación para alertas', error);
+      _scheduleEmergencyQueryRetry(location, generation);
     }
   }
 
   void _scheduleEmergencyQueryRetry(LatLng location, int generation) {
+    if (_emergencyRetryTimer?.isActive == true) return;
+
     if (_emergencyRetryAttempt < _emergencyRetryDelays.length) {
       final delay = _emergencyRetryDelays[_emergencyRetryAttempt++];
       _emergencyRetryTimer?.cancel();
       _emergencyRetryTimer = Timer(
         delay,
-        () => unawaited(_runEmergencyQuery(location, generation)),
+        () {
+          _emergencyRetryTimer = null;
+          _runEmergencyQuery(location, generation);
+        },
       );
       return;
     }
@@ -505,7 +528,10 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     _emergencyRetryTimer?.cancel();
     _emergencyRetryTimer = Timer(
       _emergencyRetryDelays.last,
-      () => unawaited(_runEmergencyQuery(location, generation)),
+      () {
+        _emergencyRetryTimer = null;
+        _runEmergencyQuery(location, generation);
+      },
     );
   }
 
@@ -647,7 +673,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
             SizedBox(width: 8),
             Expanded(
               child: Text(
-                'No se pudieron actualizar las alertas. Reintentando...',
+                'No se pudieron cargar las alertas cercanas. Reintentando...',
                 style: TextStyle(color: Colors.white, fontSize: 12),
               ),
             ),

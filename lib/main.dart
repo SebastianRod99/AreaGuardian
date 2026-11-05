@@ -9,6 +9,8 @@ import 'package:firebase_messaging/firebase_messaging.dart';
 import 'widgets/bar_nav.dart';
 import 'screens/auth/login.dart';
 import 'screens/auth/register.dart';
+import 'screens/auth/session_restore_error_screen.dart';
+import 'services/auth_service.dart';
 import 'services/notification_service.dart';
 import 'services/session_service.dart';
 import 'services/app_telemetry_service.dart';
@@ -77,7 +79,7 @@ class _AuthCheckScreenState extends State<AuthCheckScreen> {
   bool _isLoggedIn = false;
   bool _isRegistered = false;
   bool _needsConsent = false;
-  String? _errorMessage;
+  Object? _restoreError;
 
   @override
   void initState() {
@@ -89,7 +91,7 @@ class _AuthCheckScreenState extends State<AuthCheckScreen> {
     final firebaseUser = FirebaseAuth.instance.currentUser;
     var isRegistered = false;
     var needsConsent = false;
-    String? errorMessage;
+    Object? restoreError;
     if (firebaseUser != null) {
       try {
         isRegistered = await SessionService().restoreSession(firebaseUser);
@@ -97,7 +99,12 @@ class _AuthCheckScreenState extends State<AuthCheckScreen> {
           userId: firebaseUser.uid,
         );
       } catch (error) {
-        errorMessage = 'No se pudo restaurar tu perfil: $error';
+        final code = error is FirebaseException ? error.code : 'n/a';
+        debugPrint(
+          'AuthCheck session restore failed: '
+          'type=${error.runtimeType}, code=$code, error=$error',
+        );
+        restoreError = error;
       }
     } else {
       needsConsent = !await ConsentService().hasCurrentConsent();
@@ -107,8 +114,20 @@ class _AuthCheckScreenState extends State<AuthCheckScreen> {
       _isLoggedIn = firebaseUser != null;
       _isRegistered = isRegistered;
       _needsConsent = needsConsent;
-      _errorMessage = errorMessage;
+      _restoreError = restoreError;
       _isLoading = false;
+    });
+  }
+
+  Future<void> _signOutAfterRestoreError() async {
+    await AuthService().signOut();
+    await SessionService().clearLocalSession();
+    if (!mounted) return;
+    setState(() {
+      _isLoggedIn = false;
+      _isRegistered = false;
+      _needsConsent = false;
+      _restoreError = null;
     });
   }
 
@@ -122,30 +141,17 @@ class _AuthCheckScreenState extends State<AuthCheckScreen> {
       );
     }
 
-    if (_errorMessage != null) {
-      return Scaffold(
-        body: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(_errorMessage!, textAlign: TextAlign.center),
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: () {
-                    setState(() {
-                      _isLoading = true;
-                      _errorMessage = null;
-                    });
-                    _checkSession();
-                  },
-                  child: const Text('Reintentar'),
-                ),
-              ],
-            ),
-          ),
-        ),
+    if (_restoreError != null) {
+      return SessionRestoreErrorScreen(
+        error: _restoreError!,
+        onRetry: () {
+          setState(() {
+            _isLoading = true;
+            _restoreError = null;
+          });
+          return _checkSession();
+        },
+        onSignOut: _signOutAfterRestoreError,
       );
     }
 

@@ -35,6 +35,10 @@ class ConsentService {
           .collection('users')
           .doc(userId)
           .get(const GetOptions(source: Source.server));
+      debugPrint(
+        'Consent check read users/{uid} source=server: '
+        'exists=${snapshot.exists}',
+      );
       if (!snapshot.exists ||
           snapshot.data()?['consentVersion'] != currentVersion) {
         return false;
@@ -49,11 +53,25 @@ class ConsentService {
       await AppTelemetryService.setConsent(analyticsConsent);
       return true;
     } on FirebaseException catch (error) {
+      debugPrint(
+        'Consent check read users/{uid} source=server failed: '
+        'type=${error.runtimeType}, code=${error.code}, error=$error',
+      );
       if (!_isConnectivityError(error.code)) rethrow;
-      final cachedSnapshot = await _firestore
-          .collection('users')
-          .doc(userId)
-          .get(const GetOptions(source: Source.cache));
+      DocumentSnapshot<Map<String, dynamic>> cachedSnapshot;
+      try {
+        cachedSnapshot = await _firestore
+            .collection('users')
+            .doc(userId)
+            .get(const GetOptions(source: Source.cache));
+      } on FirebaseException catch (cacheError) {
+        debugPrint(
+          'Consent check read users/{uid} source=cache failed: '
+          'type=${cacheError.runtimeType}, code=${cacheError.code}, '
+          'error=$cacheError',
+        );
+        rethrow;
+      }
       if (cachedSnapshot.data()?['consentVersion'] != currentVersion) {
         return false;
       }
@@ -87,12 +105,23 @@ class ConsentService {
     final prefs = await SharedPreferences.getInstance();
     if (!_hasCurrentLocalConsent(prefs)) return;
     final userReference = _firestore.collection('users').doc(userId);
+    DocumentSnapshot<Map<String, dynamic>> userSnapshot;
     try {
-      final userSnapshot = await userReference.get(
+      userSnapshot = await userReference.get(
         const GetOptions(source: Source.server),
       );
-      if (!userSnapshot.exists) return;
+    } on FirebaseException catch (error) {
+      debugPrint(
+        'Consent sync read users/{uid} source=server failed: '
+        'type=${error.runtimeType}, code=${error.code}, error=$error',
+      );
+      if (!_isConnectivityError(error.code)) rethrow;
+      debugPrint('El consentimiento se sincronizará al recuperar la red.');
+      return;
+    }
+    if (!userSnapshot.exists) return;
 
+    try {
       await userReference.update({
         'consentVersion': currentVersion,
         'consentAcceptedAt': FieldValue.serverTimestamp(),
@@ -100,6 +129,10 @@ class ConsentService {
       });
       await prefs.setString(_uidKey, userId);
     } on FirebaseException catch (error) {
+      debugPrint(
+        'Consent sync update users/{uid} failed: '
+        'type=${error.runtimeType}, code=${error.code}, error=$error',
+      );
       if (!_isConnectivityError(error.code)) rethrow;
       debugPrint('El consentimiento se sincronizará al recuperar la red.');
     }

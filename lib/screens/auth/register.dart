@@ -9,6 +9,9 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:areaguardian/services/firestore_service.dart';
 import 'package:areaguardian/services/session_service.dart';
 import 'package:areaguardian/services/consent_service.dart';
+import 'package:areaguardian/services/auth_service.dart';
+import 'package:areaguardian/screens/auth/login.dart';
+import 'package:areaguardian/screens/auth/session_restore_error_screen.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geocoding/geocoding.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -34,7 +37,7 @@ class _RegisterState extends State<Register> {
   LatLng? _selectedShopCoords;
   bool _isLoading = false;
   bool _isCheckingProfile = true;
-  String? _profileCheckError;
+  Object? _profileCheckError;
 
   final FirestoreService _firestoreService = FirestoreService();
   final SessionService _sessionService = SessionService();
@@ -69,10 +72,29 @@ class _RegisterState extends State<Register> {
     } catch (error) {
       if (!mounted) return;
       setState(() {
-        _profileCheckError = 'No se pudo verificar tu perfil: $error';
+        _profileCheckError = error;
         _isCheckingProfile = false;
       });
     }
+  }
+
+  Future<void> _retryProfileCheck() async {
+    setState(() {
+      _isCheckingProfile = true;
+      _profileCheckError = null;
+    });
+    await _checkForExistingProfile();
+  }
+
+  Future<void> _signOutAfterProfileError() async {
+    await AuthService().signOut();
+    await _sessionService.clearLocalSession();
+    if (!mounted) return;
+    Navigator.pushAndRemoveUntil(
+      context,
+      MaterialPageRoute(builder: (_) => const LoginScreen()),
+      (route) => false,
+    );
   }
 
   // Función para abrir el mapa y capturar el punto exacto del PUESTO
@@ -285,29 +307,10 @@ class _RegisterState extends State<Register> {
     }
 
     if (_profileCheckError != null) {
-      return Scaffold(
-        body: Center(
-          child: Padding(
-            padding: const EdgeInsets.all(24),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(_profileCheckError!, textAlign: TextAlign.center),
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed: () {
-                    setState(() {
-                      _isCheckingProfile = true;
-                      _profileCheckError = null;
-                    });
-                    _checkForExistingProfile();
-                  },
-                  child: const Text('Reintentar'),
-                ),
-              ],
-            ),
-          ),
-        ),
+      return SessionRestoreErrorScreen(
+        error: _profileCheckError!,
+        onRetry: _retryProfileCheck,
+        onSignOut: _signOutAfterProfileError,
       );
     }
 

@@ -5,7 +5,8 @@ rules_version = '2';
 //   owner-editable profile/contact/location fields; role and vendorId are fixed.
 // vendors/{uid}: owner profile and active-post state, coordinates, catalog
 //   (up to 50 strings), payment handles, current location and FCM token.
-// public_vendors/{uid}: Cloud Functions projection; signed-in read-only data.
+// public_vendors/{uid}: Cloud Functions projection; signed-in reads and writes
+//   restricted to the owner and values matching their private vendor profile.
 // emergencies/{id}: owner-created active alert with identity, role, coordinates,
 //   timestamp and isTest. SMS, FCM recipients and delivery states are server-only.
 service cloud.firestore {
@@ -24,10 +25,6 @@ service cloud.firestore {
 
     function uidUnchanged() {
       return request.resource.data.id == request.auth.uid;
-    }
-
-    function uidNotModified() {
-      return request.resource.data.id == resource.data.id;
     }
 
     function isValidUserProfile(userId) {
@@ -116,6 +113,39 @@ service cloud.firestore {
           (data.fcmToken is string && data.fcmToken.size() <= 4096));
     }
 
+    function isValidPublicVendor(vendorId) {
+      let data = request.resource.data;
+      let vendor = get(
+        /databases/$(database)/documents/vendors/$(vendorId)
+      ).data;
+      return data.keys().hasOnly([
+          'id', 'shopName', 'address', 'latitude', 'longitude',
+          'currentLatitude', 'currentLongitude', 'lastLocationUpdate',
+          'isActive', 'nequiNumber', 'daviplataNumber', 'llaveNumber',
+          'catalog'
+        ])
+        && data.keys().hasAll([
+          'id', 'shopName', 'address', 'latitude', 'longitude',
+          'currentLatitude', 'currentLongitude', 'lastLocationUpdate',
+          'isActive', 'nequiNumber', 'daviplataNumber', 'llaveNumber',
+          'catalog'
+        ])
+        && vendor.userId == request.auth.uid
+        && data.id == vendorId
+        && data.shopName == vendor.get('shopName', '')
+        && data.address == vendor.get('address', '')
+        && data.latitude == vendor.get('latitude', 0)
+        && data.longitude == vendor.get('longitude', 0)
+        && data.currentLatitude == vendor.get('currentLatitude', null)
+        && data.currentLongitude == vendor.get('currentLongitude', null)
+        && data.lastLocationUpdate == vendor.get('lastLocationUpdate', null)
+        && data.isActive == vendor.get('isActive', false)
+        && data.nequiNumber == vendor.get('nequiNumber', '')
+        && data.daviplataNumber == vendor.get('daviplataNumber', '')
+        && data.llaveNumber == vendor.get('llaveNumber', '')
+        && data.catalog == vendor.get('catalog', []);
+    }
+
     function emergencyPointerUpdateIsValid(userId) {
       let previousId = resource.data.get('activeEmergencyId', null);
       let nextId = request.resource.data.get('activeEmergencyId', null);
@@ -177,7 +207,7 @@ service cloud.firestore {
     }
 
     match /users/{userId} {
-      allow read: if isSelf(userId);
+      allow get, list: if isSelf(userId);
       allow create: if isSelf(userId)
         && uidUnchanged()
         && isValidUserProfile(userId)
@@ -185,12 +215,7 @@ service cloud.firestore {
         && (!request.resource.data.isVendor
           || request.resource.data.vendorId == userId);
       allow update: if isSelf(userId)
-        && uidNotModified()
         && isValidUserProfile(userId)
-        && request.resource.data.id == resource.data.id
-        && request.resource.data.get('vendorId', null) ==
-          resource.data.get('vendorId', null)
-        && request.resource.data.isVendor == resource.data.isVendor
         && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
           'name', 'phone', 'emergencyContact', 'lastSeen', 'activeEmergencyId',
           'fcmToken', 'lastLoginAt', 'appVersion', 'profilePhotoUrl',
@@ -203,21 +228,20 @@ service cloud.firestore {
     }
 
     match /vendors/{vendorId} {
-      allow read: if isSelf(vendorId);
+      allow get, list: if isSelf(vendorId);
       allow create: if isSelf(vendorId)
         && isValidVendor(vendorId)
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.vendorId == vendorId;
       allow update: if isSelf(vendorId)
-        && resource.data.userId == request.auth.uid
-        && isValidVendor(vendorId)
-        && request.resource.data.userId == resource.data.userId
-        && request.resource.data.id == resource.data.id;
-      allow delete: if isSelf(vendorId) && resource.data.userId == request.auth.uid;
+        && isValidVendor(vendorId);
+      allow delete: if isSelf(vendorId);
     }
 
     match /public_vendors/{vendorId} {
       allow read: if signedIn();
-      allow write: if false;
+      allow create, update: if isSelf(vendorId)
+        && isValidPublicVendor(vendorId);
+      allow delete: if isSelf(vendorId);
     }
 
     match /emergencies/{emergencyId} {

@@ -1,10 +1,12 @@
 import 'package:flutter/material.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:areaguardian/widgets/bar_nav.dart';
 import 'package:areaguardian/services/auth_service.dart';
 import 'package:areaguardian/services/session_service.dart';
 import 'package:areaguardian/services/consent_service.dart';
 import 'package:areaguardian/screens/consent_screen.dart';
+import 'package:areaguardian/screens/auth/session_restore_error_screen.dart';
 import 'package:areaguardian/screens/map_dashboard_screen.dart';
 
 import 'register.dart';
@@ -23,11 +25,14 @@ class _LoginScreenState extends State<LoginScreen> {
   final AuthService _authService = AuthService();
   bool _isLoading = false;
   String? _errorMessage;
+  Object? _restoreError;
+  User? _restoreUser;
 
   Future<void> _signInWithGoogle() async {
     setState(() {
       _isLoading = true;
       _errorMessage = null;
+      _restoreError = null;
     });
 
     try {
@@ -36,44 +41,99 @@ class _LoginScreenState extends State<LoginScreen> {
       if (user == null) {
         throw StateError('No se encontró la sesión de Google.');
       }
-      final isRegistered = await SessionService().restoreSession(user);
-      final needsConsent = !await ConsentService().hasCurrentConsent(
-        userId: user.uid,
-      );
-
-      if (!mounted) return;
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(
-          builder: (routeContext) => needsConsent
-              ? ConsentScreen(
-                  onAccepted: () async {
-                    Navigator.of(routeContext).pushReplacement(
-                      MaterialPageRoute(
-                        builder: (_) => isRegistered
-                            ? const AppShell(initialIndex: 0)
-                            : const Register(),
-                      ),
-                    );
-                  },
-                )
-              : isRegistered
-              ? const AppShell(initialIndex: 0)
-              : const Register(),
-        ),
-      );
+      _restoreUser = user;
+      await _restoreAndNavigate(user);
     } on FirebaseAuthException catch (error) {
       if (mounted) setState(() => _errorMessage = error.message ?? error.code);
     } catch (error) {
-      if (mounted)
-        setState(() => _errorMessage = 'No se pudo iniciar sesión: $error');
+      final code = error is FirebaseException ? error.code : 'n/a';
+      debugPrint(
+        'Google sign-in or session restore failed: '
+        'type=${error.runtimeType}, code=$code, error=$error',
+      );
+      if (mounted) {
+        if (_restoreUser != null) {
+          setState(() => _restoreError = error);
+        } else {
+          setState(() => _errorMessage = 'No se pudo iniciar sesión: $error');
+        }
+      }
     } finally {
       if (mounted) setState(() => _isLoading = false);
     }
   }
 
+  Future<void> _restoreAndNavigate(User user) async {
+    final isRegistered = await SessionService().restoreSession(user);
+    final needsConsent = !await ConsentService().hasCurrentConsent(
+      userId: user.uid,
+    );
+
+    if (!mounted) return;
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (routeContext) => needsConsent
+            ? ConsentScreen(
+                onAccepted: () async {
+                  Navigator.of(routeContext).pushReplacement(
+                    MaterialPageRoute(
+                      builder: (_) => isRegistered
+                          ? const AppShell(initialIndex: 0)
+                          : const Register(),
+                    ),
+                  );
+                },
+              )
+            : isRegistered
+            ? const AppShell(initialIndex: 0)
+            : const Register(),
+      ),
+    );
+  }
+
+  Future<void> _retryRestore() async {
+    final user = _restoreUser;
+    if (user == null) return;
+    setState(() {
+      _isLoading = true;
+      _restoreError = null;
+    });
+    try {
+      await _restoreAndNavigate(user);
+    } catch (error) {
+      final code = error is FirebaseException ? error.code : 'n/a';
+      debugPrint(
+        'Session restore retry failed: '
+        'type=${error.runtimeType}, code=$code, error=$error',
+      );
+      if (mounted) setState(() => _restoreError = error);
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _signOutAfterRestoreError() async {
+    await _authService.signOut();
+    await SessionService().clearLocalSession();
+    if (!mounted) return;
+    setState(() {
+      _restoreUser = null;
+      _restoreError = null;
+      _errorMessage = null;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
+    if (_restoreError != null) {
+      return SessionRestoreErrorScreen(
+        error: _restoreError!,
+        onRetry: _retryRestore,
+        onSignOut: _signOutAfterRestoreError,
+      );
+    }
+
     return Scaffold(
       backgroundColor: const Color(0xFF121420),
       body: SafeArea(

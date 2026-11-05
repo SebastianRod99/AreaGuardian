@@ -10,6 +10,16 @@ import '../models/user_model.dart';
 import 'app_telemetry_service.dart';
 import '../utils/geo_utils.dart';
 
+class ActiveEmergenciesSnapshot {
+  final List<EmergencyModel> emergencies;
+  final bool isFromCache;
+
+  const ActiveEmergenciesSnapshot({
+    required this.emergencies,
+    required this.isFromCache,
+  });
+}
+
 class FirestoreService {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
   static const Duration emergencyVisibilityDuration = Duration(minutes: 20);
@@ -394,12 +404,15 @@ class FirestoreService {
     return status is String ? status : null;
   }
 
-  Stream<List<EmergencyModel>> watchActiveEmergencies({
+  Stream<ActiveEmergenciesSnapshot> watchActiveEmergencies({
     required double latitude,
     required double longitude,
   }) {
-    return _nearbyEmergencyQuery(latitude, longitude).snapshots().map(
-      (snapshot) => snapshot.docs
+    return _nearbyEmergencyQuery(
+      latitude,
+      longitude,
+    ).snapshots(includeMetadataChanges: true).map((snapshot) {
+      final emergencies = snapshot.docs
           .map((doc) {
             final data = doc.data();
             data['id'] = data['id'] ?? doc.id;
@@ -410,8 +423,12 @@ class FirestoreService {
                 _isVisibleEmergency(emergency) &&
                 _isWithinEmergencyRadius(emergency, latitude, longitude),
           )
-          .toList(),
-    );
+          .toList();
+      return ActiveEmergenciesSnapshot(
+        emergencies: emergencies,
+        isFromCache: snapshot.metadata.isFromCache,
+      );
+    });
   }
 
   Query<Map<String, dynamic>> _nearbyEmergencyQuery(

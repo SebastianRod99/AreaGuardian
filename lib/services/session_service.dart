@@ -1,5 +1,6 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:flutter/foundation.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'consent_service.dart';
@@ -13,7 +14,13 @@ class SessionService {
 
   Future<bool> restoreSession(User user) async {
     final userReference = _firestore.collection('users').doc(user.uid);
-    final userSnapshot = await _getWithCacheFallback(userReference);
+    final userSnapshot = await _getWithCacheFallback(
+      userReference,
+      'users/{uid}',
+    );
+    debugPrint(
+      'Session restore read users/{uid}: exists=${userSnapshot.exists}',
+    );
     if (!userSnapshot.exists) return false;
 
     final userData = userSnapshot.data();
@@ -24,15 +31,21 @@ class SessionService {
     final vendorSnapshot = isVendor
         ? await _getWithCacheFallback(
             _firestore.collection('vendors').doc(user.uid),
+            'vendors/{uid}',
           )
         : null;
     final vendorData = vendorSnapshot?.data();
     final packageInfo = await PackageInfo.fromPlatform();
 
-    await userReference.set({
-      'lastLoginAt': FieldValue.serverTimestamp(),
-      'appVersion': '${packageInfo.version}+${packageInfo.buildNumber}',
-    }, SetOptions(merge: true));
+    try {
+      await userReference.set({
+        'lastLoginAt': FieldValue.serverTimestamp(),
+        'appVersion': '${packageInfo.version}+${packageInfo.buildNumber}',
+      }, SetOptions(merge: true));
+    } catch (error) {
+      _logSessionFirestoreError('write users/{uid}', error);
+      rethrow;
+    }
 
     final prefs = await SharedPreferences.getInstance();
     if (prefs.getString('auth_uid') != user.uid) {
@@ -122,18 +135,49 @@ class SessionService {
 
   Future<DocumentSnapshot<Map<String, dynamic>>> _getWithCacheFallback(
     DocumentReference<Map<String, dynamic>> reference,
+    String path,
   ) async {
     try {
-      return await reference.get(const GetOptions(source: Source.server));
-    } on FirebaseException catch (serverError) {
-      if (!_isConnectivityError(serverError.code)) rethrow;
-
-      final cachedSnapshot = await reference.get(
-        const GetOptions(source: Source.cache),
+      final snapshot = await reference.get(
+        const GetOptions(source: Source.server),
       );
-      if (cachedSnapshot.exists) return cachedSnapshot;
+      debugPrint(
+        'Session restore read $path source=server: exists=${snapshot.exists}',
+      );
+      return snapshot;
+    } on FirebaseException catch (serverError) {
+      if (!_isConnectivityError(serverError.code)) {
+        _logSessionFirestoreError('read $path source=server', serverError);
+        rethrow;
+      }
+
+      debugPrint(
+        'Session restore read $path source=server failed: '
+        'type=${serverError.runtimeType}, code=${serverError.code}, '
+        'error=$serverError',
+      );
+      try {
+        final cachedSnapshot = await reference.get(
+          const GetOptions(source: Source.cache),
+        );
+        debugPrint(
+          'Session restore read $path source=cache: '
+          'exists=${cachedSnapshot.exists}',
+        );
+        if (cachedSnapshot.exists) return cachedSnapshot;
+      } catch (cacheError) {
+        _logSessionFirestoreError('read $path source=cache', cacheError);
+      }
       rethrow;
     }
+  }
+
+  void _logSessionFirestoreError(String operation, Object error) {
+    final code = error is FirebaseException ? error.code : 'n/a';
+    debugPrint(
+      'Session restore $operation failed: '
+      'type=${error.runtimeType}, code=$code, error=$error',
+    );
   }
 
   bool _isConnectivityError(String code) {
