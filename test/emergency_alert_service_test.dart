@@ -245,33 +245,24 @@ void main() {
     },
   );
 
-  test(
-    'dispara tras diez segundos de inclinación estable superior a 20°',
-    () async {
-      final callbackCompleted = Completer<void>();
-      var triggered = 0;
-      final service = ProtectionService(
-        onEmergencyTriggered: () {
-          triggered++;
-          callbackCompleted.complete();
-        },
+  test('no dispara por inclinación estable durante diez segundos', () {
+    var triggered = 0;
+    final service = ProtectionService(onEmergencyTriggered: () => triggered++);
+    service.activate(listen: false);
+
+    final start = DateTime(2024, 1, 1, 12, 0, 0);
+    for (var second = 0; second <= 10; second++) {
+      service.handleMotionSample(
+        start.add(Duration(seconds: second)),
+        userAcceleration: 0,
+        tiltDegrees: 25,
       );
-      service.activate(listen: false);
+    }
 
-      final start = DateTime(2024, 1, 1, 12, 0, 0);
-      for (var second = 0; second <= 10; second++) {
-        service.handleMotionSample(
-          start.add(Duration(seconds: second)),
-          userAcceleration: 0,
-          tiltDegrees: 25,
-        );
-      }
-
-      await callbackCompleted.future;
-      expect(triggered, 1);
-      service.deactivate();
-    },
-  );
+    expect(triggered, 0);
+    expect(service.isAlarmActive, isFalse);
+    service.deactivate();
+  });
 
   test('no dispara el modo sostenido por movimiento rítmico de trote', () {
     var triggered = 0;

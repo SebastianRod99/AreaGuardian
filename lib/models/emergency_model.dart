@@ -10,10 +10,7 @@ class EmergencyModel {
   final double longitude;
   final DateTime timestamp;
   final String status; // 'active', 'resolved'
-  final String smsStatus; // 'pending', 'sent', 'failed'
   final bool isTest;
-  // Puestos activos dentro del radio. El backend recalcula esta lista antes
-  // de enviar notificaciones y nunca confía en una lista del cliente.
   final List<String> notifiedVendorIds;
 
   EmergencyModel({
@@ -26,27 +23,9 @@ class EmergencyModel {
     required this.longitude,
     required this.timestamp,
     this.status = 'active',
-    this.smsStatus = 'pending',
     this.isTest = false,
     this.notifiedVendorIds = const [],
   });
-
-  EmergencyModel copyWithSmsStatus(String value) {
-    return EmergencyModel(
-      id: id,
-      userId: userId,
-      userName: userName,
-      role: role,
-      shopName: shopName,
-      latitude: latitude,
-      longitude: longitude,
-      timestamp: timestamp,
-      status: status,
-      smsStatus: value,
-      isTest: isTest,
-      notifiedVendorIds: notifiedVendorIds,
-    );
-  }
 
   Map<String, dynamic> toJson() {
     return {
@@ -59,7 +38,6 @@ class EmergencyModel {
       'longitude': longitude,
       'timestamp': timestamp.toIso8601String(),
       'status': status,
-      'smsStatus': smsStatus,
       'isTest': isTest,
       'notifiedVendorIds': notifiedVendorIds,
     };
@@ -76,7 +54,6 @@ class EmergencyModel {
       longitude: json['longitude']?.toDouble() ?? 0.0,
       timestamp: _parseTimestamp(json['timestamp']),
       status: json['status'] ?? 'active',
-      smsStatus: json['smsStatus'] ?? 'pending',
       isTest: json['isTest'] == true,
       notifiedVendorIds:
           (json['notifiedVendorIds'] as List<dynamic>?)

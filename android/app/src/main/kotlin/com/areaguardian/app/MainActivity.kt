@@ -1,4 +1,4 @@
-package com.example.areaguardian
+package com.areaguardian.app
 
 import io.flutter.embedding.android.FlutterActivity
 

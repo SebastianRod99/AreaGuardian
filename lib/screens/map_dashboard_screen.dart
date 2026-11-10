@@ -94,7 +94,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   List<VendorModel> _puestosVecinos = [];
   List<EmergencyModel> _emergencies = [];
   StreamSubscription<List<VendorModel>>? _vendorSubscription;
-  StreamSubscription<List<EmergencyModel>>? _emergencySubscription;
+  StreamSubscription<ActiveEmergenciesSnapshot>? _emergencySubscription;
   Timer? _emergencyExpiryTimer;
   VendorModel? _selectedVendorPuesto;
   bool _isMyPuestoSelected = false;
@@ -144,8 +144,7 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   }
 
   LatLng? get _emergencyMonitoringLocation {
-    final location =
-        _myLocation ?? (_isVendorRole ? _myPuestoLocation : null);
+    final location = _myLocation ?? (_isVendorRole ? _myPuestoLocation : null);
     if (location == null ||
         !location.latitude.isFinite ||
         !location.longitude.isFinite ||
@@ -428,13 +427,20 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     _emergencySubscription = null;
     _emergencyPendingCenter = location;
     _emergencyRetryAttempt = 0;
-    _runEmergencyQuery(location, generation);
+    unawaited(_runEmergencyQuery(location, generation));
   }
 
-  void _runEmergencyQuery(LatLng location, int generation) {
+  Future<void> _runEmergencyQuery(LatLng location, int generation) async {
     if (!mounted ||
         generation != _emergencyQueryGeneration ||
         _userId.isEmpty ||
+        FirebaseAuth.instance.currentUser?.uid != _userId) {
+      return;
+    }
+
+    if (!await _updateEmergencyQueryLocation(location, generation)) return;
+    if (!mounted ||
+        generation != _emergencyQueryGeneration ||
         FirebaseAuth.instance.currentUser?.uid != _userId) {
       return;
     }
@@ -480,18 +486,16 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       _scheduleEmergencyQueryRetry(location, generation);
       return;
     }
-
-    unawaited(_updateEmergencyQueryLocation(location, generation));
   }
 
-  Future<void> _updateEmergencyQueryLocation(
+  Future<bool> _updateEmergencyQueryLocation(
     LatLng location,
     int generation,
   ) async {
     if (!mounted ||
         generation != _emergencyQueryGeneration ||
         FirebaseAuth.instance.currentUser?.uid != _userId) {
-      return;
+      return false;
     }
 
     try {
@@ -499,10 +503,12 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
         latitude: location.latitude,
         longitude: location.longitude,
       );
+      return true;
     } catch (error) {
-      if (!mounted || generation != _emergencyQueryGeneration) return;
+      if (!mounted || generation != _emergencyQueryGeneration) return false;
       _logEmergencyQueryError('actualizar ubicación para alertas', error);
       _scheduleEmergencyQueryRetry(location, generation);
+      return false;
     }
   }
 
@@ -512,13 +518,10 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
     if (_emergencyRetryAttempt < _emergencyRetryDelays.length) {
       final delay = _emergencyRetryDelays[_emergencyRetryAttempt++];
       _emergencyRetryTimer?.cancel();
-      _emergencyRetryTimer = Timer(
-        delay,
-        () {
-          _emergencyRetryTimer = null;
-          _runEmergencyQuery(location, generation);
-        },
-      );
+      _emergencyRetryTimer = Timer(delay, () {
+        _emergencyRetryTimer = null;
+        unawaited(_runEmergencyQuery(location, generation));
+      });
       return;
     }
 
@@ -526,13 +529,10 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
       setState(() => _showEmergencyQueryWarning = true);
     }
     _emergencyRetryTimer?.cancel();
-    _emergencyRetryTimer = Timer(
-      _emergencyRetryDelays.last,
-      () {
-        _emergencyRetryTimer = null;
-        _runEmergencyQuery(location, generation);
-      },
-    );
+    _emergencyRetryTimer = Timer(_emergencyRetryDelays.last, () {
+      _emergencyRetryTimer = null;
+      unawaited(_runEmergencyQuery(location, generation));
+    });
   }
 
   void _watchUserLocation() {
@@ -838,10 +838,27 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
 
   // ── MAPA (FlutterMap / OpenStreetMap) ─────────────────────────────────────
   Widget _buildMap() {
+    final focusCenter =
+        widget.focusLatitude != null && widget.focusLongitude != null
+        ? LatLng(widget.focusLatitude!, widget.focusLongitude!)
+        : null;
+    final initialCenter = focusCenter ?? _myLocation ?? _myPuestoLocation;
+    if (initialCenter == null) {
+      return Center(
+        child: Icon(
+          _locationPermissionPending
+              ? Icons.location_searching
+              : Icons.location_off,
+          color: Colors.white54,
+          size: 36,
+        ),
+      );
+    }
+
     return FlutterMap(
       mapController: _mapController,
       options: MapOptions(
-        initialCenter: _myLocation ?? const LatLng(4.6742, -74.1468),
+        initialCenter: initialCenter,
         initialZoom: 16.5,
         onMapReady: () {
           _mapReady = true;
@@ -1056,8 +1073,8 @@ class _MapDashboardScreenState extends State<MapDashboardScreen> {
   // ── AVISO UBICACIÓN DENEGADA ──────────────────────────────────────────────
   Widget _buildLocationWarning() {
     final message = _locationPermissionPending
-        ? 'Esperando permiso de ubicación — mostrando Bogotá'
-        : 'Ubicación no disponible — mostrando Bogotá';
+        ? 'Esperando permiso de ubicación'
+        : 'Ubicación no disponible';
     return Positioned(
       top: 12,
       left: 12,

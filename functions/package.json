@@ -2,7 +2,7 @@
   "name": "functions",
   "description": "Cloud Functions para AreaGuardian — notificaciones de emergencia",
   "engines": {
-    "node": "20"
+    "node": "22"
   },
   "main": "index.js",
   "scripts": {
@@ -16,8 +16,7 @@
   },
   "dependencies": {
     "firebase-admin": "^13.0.2",
-    "firebase-functions": "^6.3.1",
-    "twilio": "^6.1.2"
+    "firebase-functions": "^6.3.1"
   },
   "private": true,
   "devDependencies": {

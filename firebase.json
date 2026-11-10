@@ -23,5 +23,31 @@
         "npm --prefix \"$RESOURCE_DIR\" run build"
       ]
     }
-  ]
+  ],
+  "emulators": {
+    "firestore": { "port": 8080 },
+    "functions": { "port": 5001 },
+    "pubsub": { "port": 8085 },
+    "storage": { "port": 9199 },
+    "ui": { "enabled": false }
+  },
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "areaguardian-78eb8",
+          "appId": "1:967999112644:android:f9a6f9083226df83279091",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "areaguardian-78eb8",
+          "configurations": {
+            "android": "1:967999112644:android:f9a6f9083226df83279091"
+          }
+        }
+      }
+    }
+  }
 }

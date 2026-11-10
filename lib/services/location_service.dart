@@ -191,8 +191,9 @@ class LocationService {
     }
 
     try {
-      final lastKnownPosition = await Geolocator.getLastKnownPosition()
-          .timeout(_lastKnownPositionTimeout);
+      final lastKnownPosition = await Geolocator.getLastKnownPosition().timeout(
+        _lastKnownPositionTimeout,
+      );
       if (lastKnownPosition != null &&
           DateTime.now().difference(lastKnownPosition.timestamp) <=
               const Duration(minutes: 5)) {
@@ -203,26 +204,5 @@ class LocationService {
     }
 
     return getFreshLocationOrNull();
-  }
-
-  // Obtener la ubicación actual del usuario
-  Future<Position> getCurrentLocation() async {
-    return await getCurrentLocationOrNull() ?? _getDefaultLocation();
-  }
-
-  // Ubicación de respaldo por defecto (Bogotá - Zona de prueba)
-  Position _getDefaultLocation() {
-    return Position(
-      latitude: 4.6738,
-      longitude: -74.1467,
-      timestamp: DateTime.now(),
-      accuracy: 1.0,
-      altitude: 0.0,
-      heading: 0.0,
-      speed: 0.0,
-      speedAccuracy: 0.0,
-      altitudeAccuracy: 0.0,
-      headingAccuracy: 0.0,
-    );
   }
 }

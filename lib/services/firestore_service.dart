@@ -2,8 +2,6 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/foundation.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
-import 'dart:math' as math;
-
 import '../models/vendor_model.dart';
 import '../models/emergency_model.dart';
 import '../models/user_model.dart';
@@ -24,7 +22,6 @@ class FirestoreService {
   final FirebaseFirestore _db = FirebaseFirestore.instance;
   static const Duration emergencyVisibilityDuration = Duration(minutes: 20);
   static const Duration _emergencySurveyDelay = Duration(minutes: 10);
-  static const Duration _emergencyCancellationGrace = Duration(seconds: 20);
   static const double emergencyAlertRadiusMeters = 300;
 
   Future<void> updateUserCurrentLocation({
@@ -115,7 +112,11 @@ class FirestoreService {
           emergencySnapshot.data()?['userId'] != authenticatedUser.uid) {
         throw StateError('La emergencia no pertenece al usuario autenticado.');
       }
-      if (emergencySnapshot.data()?['surveyFeedback'] != null) {
+      final emergency = emergencySnapshot.data()!;
+      if (emergency['isTest'] == true || emergency['status'] == 'cancelled') {
+        throw StateError('Esta emergencia no admite una encuesta.');
+      }
+      if (emergency['surveyFeedback'] != null) {
         throw StateError('Esta encuesta ya fue respondida.');
       }
 
@@ -339,10 +340,9 @@ class FirestoreService {
     required double longitude,
   }) async {
     try {
-      final snapshot = await _nearbyEmergencyQuery(
-        latitude,
-        longitude,
-      ).get(const GetOptions(source: Source.server));
+      final snapshot = await _nearbyEmergencyQuery().get(
+        const GetOptions(source: Source.server),
+      );
       return snapshot.docs
           .map((doc) {
             final data = doc.data();
@@ -388,30 +388,13 @@ class FirestoreService {
     return EmergencyModel.fromJson(data);
   }
 
-  Future<String?> fetchEmergencySmsStatus(String emergencyId) async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      throw StateError('Debes iniciar sesión para consultar el SMS.');
-    }
-    final snapshot = await _db
-        .collection('emergencies')
-        .doc(emergencyId)
-        .get(const GetOptions(source: Source.server));
-    if (!snapshot.exists || snapshot.data()?['userId'] != user.uid) {
-      return null;
-    }
-    final status = snapshot.data()?['smsStatus'];
-    return status is String ? status : null;
-  }
-
   Stream<ActiveEmergenciesSnapshot> watchActiveEmergencies({
     required double latitude,
     required double longitude,
   }) {
-    return _nearbyEmergencyQuery(
-      latitude,
-      longitude,
-    ).snapshots(includeMetadataChanges: true).map((snapshot) {
+    return _nearbyEmergencyQuery().snapshots(includeMetadataChanges: true).map((
+      snapshot,
+    ) {
       final emergencies = snapshot.docs
           .map((doc) {
             final data = doc.data();
@@ -431,27 +414,23 @@ class FirestoreService {
     });
   }
 
-  Query<Map<String, dynamic>> _nearbyEmergencyQuery(
-    double latitude,
-    double longitude,
-  ) {
-    final latitudeDelta = emergencyAlertRadiusMeters / 111320;
-    final longitudeScale = math.cos(latitude * math.pi / 180).abs();
-    final longitudeDelta =
-        emergencyAlertRadiusMeters / (111320 * math.max(longitudeScale, 0.01));
+  Query<Map<String, dynamic>> _nearbyEmergencyQuery() {
+    final userId = FirebaseAuth.instance.currentUser?.uid;
+    if (userId == null) {
+      throw StateError('Debes iniciar sesión para consultar alertas cercanas.');
+    }
     final cutoff = Timestamp.fromDate(
       DateTime.now().subtract(emergencyVisibilityDuration),
     );
+    final latestTimestamp = Timestamp.fromDate(DateTime.now());
 
     return _db
         .collection('emergencies')
         .where('status', isEqualTo: 'active')
         .where('isTest', isEqualTo: false)
+        .where('notifiedUserIds', arrayContains: userId)
         .where('timestamp', isGreaterThanOrEqualTo: cutoff)
-        .where('latitude', isGreaterThanOrEqualTo: latitude - latitudeDelta)
-        .where('latitude', isLessThanOrEqualTo: latitude + latitudeDelta)
-        .where('longitude', isGreaterThanOrEqualTo: longitude - longitudeDelta)
-        .where('longitude', isLessThanOrEqualTo: longitude + longitudeDelta);
+        .where('timestamp', isLessThanOrEqualTo: latestTimestamp);
   }
 
   bool _isWithinEmergencyRadius(
@@ -577,17 +556,9 @@ class FirestoreService {
           final emergency = doc.data();
           final timestamp = emergency['timestamp'];
           final createdAt = timestamp is Timestamp ? timestamp.toDate() : null;
-          final resolvedAt = emergency['resolvedAt'];
-          final cancelledAt = resolvedAt is Timestamp
-              ? resolvedAt.toDate()
-              : null;
           final surveyStatus = emergency['surveyNotificationStatus'];
           return emergency['isTest'] != true &&
-              !_wasCancelledDuringGrace(
-                status: emergency['status'],
-                createdAt: createdAt,
-                cancelledAt: cancelledAt,
-              ) &&
+              emergency['status'] != 'cancelled' &&
               emergency['surveyFeedback'] == null &&
               (surveyStatus == 'pending' || surveyStatus == 'failed') &&
               createdAt != null &&
@@ -610,29 +581,12 @@ class FirestoreService {
     final emergency = snapshot.data()!;
     final timestamp = emergency['timestamp'];
     final createdAt = timestamp is Timestamp ? timestamp.toDate() : null;
-    final resolvedAt = emergency['resolvedAt'];
-    final cancelledAt = resolvedAt is Timestamp ? resolvedAt.toDate() : null;
     return emergency['userId'] == user.uid &&
         emergency['isTest'] != true &&
-        !_wasCancelledDuringGrace(
-          status: emergency['status'],
-          createdAt: createdAt,
-          cancelledAt: cancelledAt,
-        ) &&
+        emergency['status'] != 'cancelled' &&
         emergency['surveyFeedback'] == null &&
         createdAt != null &&
         !createdAt.add(_emergencySurveyDelay).isAfter(DateTime.now());
-  }
-
-  bool _wasCancelledDuringGrace({
-    required Object? status,
-    required DateTime? createdAt,
-    required DateTime? cancelledAt,
-  }) {
-    return status == 'cancelled' &&
-        createdAt != null &&
-        cancelledAt != null &&
-        !cancelledAt.isAfter(createdAt.add(_emergencyCancellationGrace));
   }
 
   Future<void> resolveEmergency(String emergencyId) async {
@@ -696,7 +650,6 @@ class FirestoreService {
       longitude: emergency.longitude,
       timestamp: emergency.timestamp,
       status: emergency.status,
-      smsStatus: emergency.smsStatus,
       isTest: emergency.isTest,
       notifiedVendorIds: emergency.notifiedVendorIds,
     );
@@ -752,7 +705,6 @@ class FirestoreService {
 
         final emergencyData = savedEmergency.toJson()
           ..['timestamp'] = FieldValue.serverTimestamp()
-          ..remove('smsStatus')
           ..remove('notifiedVendorIds')
           ..remove('surveyNotificationStatus');
         transaction.set(docRef, emergencyData);

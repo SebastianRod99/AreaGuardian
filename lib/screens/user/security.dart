@@ -1,7 +1,5 @@
 import 'dart:async';
-import 'dart:io';
 
-import 'package:cloud_functions/cloud_functions.dart';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -35,13 +33,10 @@ class _SecurityScreenState extends State<SecurityScreen>
   DateTime? _gracePeriodEndsAt;
   int _graceSecondsRemaining = 0;
   bool _isCancellingAlarm = false;
-  bool _smsIsSending = false;
+  bool _smsIsOpening = false;
   bool _smsFallbackOpened = false;
-  bool _smsAutoSendStarted = false;
-  bool _smsWasCancelled = false;
-  String? _smsContactName;
   String? _smsError;
-  Future<void>? _smsDeliveryRequest;
+  bool _openSmsAfterGracePeriod = true;
 
   late AnimationController _pulseCtrl;
   late Animation<double> _pulseAnim;
@@ -85,7 +80,7 @@ class _SecurityScreenState extends State<SecurityScreen>
       if (_protectionService.activeEmergencyId != emergency.id) {
         _protectionService.markAlarmActive(emergency.id);
       }
-      _startGracePeriod(emergency);
+      _startGracePeriod(emergency, openMessageWhenElapsed: false);
     } catch (error) {
       debugPrint('No se pudo restaurar la emergencia activa para SMS: $error');
       if (mounted) {
@@ -160,7 +155,6 @@ class _SecurityScreenState extends State<SecurityScreen>
       }
       _protectionService.markAlarmActive(emergency.id);
       _activeEmergency = emergency;
-      _smsWasCancelled = false;
       activated = true;
       _startGracePeriod(emergency);
       if (mounted) {
@@ -185,14 +179,17 @@ class _SecurityScreenState extends State<SecurityScreen>
     }
   }
 
-  void _startGracePeriod(EmergencyModel emergency) {
+  void _startGracePeriod(
+    EmergencyModel emergency, {
+    bool openMessageWhenElapsed = true,
+  }) {
     _gracePeriodTimer?.cancel();
+    _openSmsAfterGracePeriod = openMessageWhenElapsed;
+    _smsError = null;
+    _smsFallbackOpened = false;
     if (emergency.id.startsWith('offline_')) {
       _gracePeriodEndsAt = null;
       _graceSecondsRemaining = 0;
-      _smsAutoSendStarted = true;
-      _smsError = 'Sin internet. Se abrirá la aplicación de mensajes.';
-      _activeEmergency = emergency.copyWithSmsStatus('failed');
       if (mounted) setState(() {});
       unawaited(_prepareEmergencySms());
       return;
@@ -205,7 +202,7 @@ class _SecurityScreenState extends State<SecurityScreen>
     if (!gracePeriodEndsAt.isAfter(DateTime.now())) {
       _gracePeriodEndsAt = null;
       _graceSecondsRemaining = 0;
-      unawaited(_sendEmergencySmsAutomatically());
+      if (openMessageWhenElapsed) unawaited(_prepareEmergencySms());
       return;
     }
     _gracePeriodEndsAt = gracePeriodEndsAt;
@@ -232,7 +229,7 @@ class _SecurityScreenState extends State<SecurityScreen>
     }
     if (gracePeriodEnded) {
       _gracePeriodTimer?.cancel();
-      unawaited(_sendEmergencySmsAutomatically());
+      if (_openSmsAfterGracePeriod) unawaited(_prepareEmergencySms());
     }
   }
 
@@ -254,168 +251,23 @@ class _SecurityScreenState extends State<SecurityScreen>
     }
   }
 
-  String get _displayContactName {
-    final savedName = _smsContactName?.trim();
-    if (savedName != null && savedName.isNotEmpty) return savedName;
-    final name = emergencyContact.split('—').first.trim();
-    return name.isNotEmpty ? name : 'tu contacto de emergencia';
-  }
-
-  Future<void> _sendEmergencySmsAutomatically() =>
-      _sendEmergencySms(sendNow: false);
-
-  Future<void> _sendEmergencySms({required bool sendNow}) async {
-    if (_smsAutoSendStarted && !sendNow) return;
-    if (_activeEmergency?.isTest == true) {
-      _smsError = 'Los simulacros no envían SMS.';
-      if (mounted) setState(() {});
-      return;
-    }
-    final existingRequest = _smsDeliveryRequest;
-    if (existingRequest != null) {
-      await existingRequest;
-      return;
-    }
-
-    _smsAutoSendStarted = true;
-    final request = _performEmergencySmsSend(sendNow: sendNow);
-    _smsDeliveryRequest = request;
-    try {
-      await request;
-    } finally {
-      if (identical(_smsDeliveryRequest, request)) {
-        _smsDeliveryRequest = null;
-      }
-    }
-  }
-
-  Future<void> _performEmergencySmsSend({required bool sendNow}) async {
-    final emergency = _activeEmergency;
-    if (emergency == null) return;
-
-    if (mounted) {
-      setState(() {
-        _smsIsSending = true;
-        _smsError = null;
-      });
-    }
-
-    try {
-      final hasInternet = await _hasInternetConnection();
-      if (_smsWasCancelled) return;
-      if (!hasInternet) {
-        _smsError = 'Sin internet. Se abrirá la aplicación de mensajes.';
-        _activeEmergency = emergency.copyWithSmsStatus('failed');
-        unawaited(AppTelemetryService.logSmsFailed());
-        if (mounted) setState(() {});
-        await _prepareEmergencySms();
-        return;
-      }
-
-      final callable =
-          FirebaseFunctions.instanceFor(
-            region: 'southamerica-east1',
-          ).httpsCallable(
-            'sendEmergencySms',
-            options: HttpsCallableOptions(timeout: const Duration(seconds: 10)),
-          );
-      final result = await callable.call({
-        'emergencyId': emergency.id,
-        'sendNow': sendNow,
-      });
-      final response = Map<String, dynamic>.from(result.data as Map);
-      if (response['status'] != 'sent') {
-        throw StateError('La función no confirmó el envío del SMS.');
-      }
-
-      final wasAlreadySent = emergency.smsStatus == 'sent';
-      _activeEmergency = emergency.copyWithSmsStatus('sent');
-      _smsContactName = response['contactName'] as String?;
-      _smsFallbackOpened = false;
-      if (!wasAlreadySent) unawaited(AppTelemetryService.logSmsSent());
-      if (mounted) setState(() {});
-    } catch (error) {
-      debugPrint('No se pudo enviar el SMS automático: $error');
-      if (_smsWasCancelled) return;
-      if (error is FirebaseFunctionsException &&
-          error.code == 'failed-precondition' &&
-          (error.message?.contains('gracia todavía no ha terminado') ??
-              false)) {
-        _smsAutoSendStarted = false;
-        _gracePeriodEndsAt = DateTime.now().add(const Duration(seconds: 1));
-        _graceSecondsRemaining = 1;
-        if (mounted) setState(() {});
-        _gracePeriodTimer?.cancel();
-        _gracePeriodTimer = Timer(
-          const Duration(seconds: 1),
-          _updateGraceCountdown,
-        );
-        return;
-      }
-      try {
-        final serverStatus = await FirestoreService()
-            .fetchEmergencySmsStatus(emergency.id)
-            .timeout(const Duration(seconds: 1));
-        if (serverStatus == 'sent') {
-          _activeEmergency = emergency.copyWithSmsStatus('sent');
-          _smsError = null;
-          if (emergency.smsStatus != 'sent') {
-            unawaited(AppTelemetryService.logSmsSent());
-          }
-          if (mounted) setState(() {});
-          return;
-        }
-      } catch (statusError) {
-        debugPrint('No se pudo comprobar el estado del SMS: $statusError');
-      }
-      _activeEmergency = emergency.copyWithSmsStatus('failed');
-      _smsError =
-          'Falló el envío automático. Se abrirá la aplicación de mensajes.';
-      unawaited(AppTelemetryService.logSmsFailed());
-      if (mounted) setState(() {});
-      await _prepareEmergencySms();
-    } finally {
-      _smsIsSending = false;
-      if (mounted) setState(() {});
-    }
-  }
-
-  Future<bool> _hasInternetConnection() async {
-    final connectivity = await Connectivity().checkConnectivity().timeout(
-      const Duration(seconds: 2),
-    );
-    if (connectivity.contains(ConnectivityResult.none)) return false;
-    try {
-      final addresses = await InternetAddress.lookup('firebase.google.com')
-          .timeout(const Duration(seconds: 2));
-      return addresses.isNotEmpty;
-    } on SocketException catch (error) {
-      debugPrint('No hay conexión de internet para el SMS: $error');
-      return false;
-    } on TimeoutException catch (error) {
-      debugPrint('La comprobación de internet agotó el tiempo: $error');
-      return false;
-    }
-  }
-
   Future<void> _prepareEmergencySms() async {
     final emergency = _activeEmergency;
-    if (emergency == null) return;
+    if (emergency == null || _smsIsOpening) return;
 
-    final rawContact = emergencyContact.trim();
-    final contactParts = rawContact.split('—');
-    final phone = normalizeColombianMobileNumber(rawContact);
-    if (phone == null) {
-      _showSmsError('Configura un teléfono válido para tu contacto.');
-      return;
-    }
+    _smsIsOpening = true;
+    _smsError = null;
+    if (mounted) setState(() {});
 
     try {
+      final rawContact = emergencyContact.trim();
+      final phone = normalizeColombianMobileNumber(rawContact);
+      if (phone == null) {
+        _showSmsError('Configura un teléfono válido para tu contacto.');
+        return;
+      }
+
       final prefs = await SharedPreferences.getInstance();
-      final contactName =
-          contactParts.length > 1 && contactParts.first.trim().isNotEmpty
-          ? contactParts.first.trim()
-          : 'contacto de emergencia';
       final userName =
           prefs.getString('user_name') ??
           prefs.getString('vendor_name') ??
@@ -431,7 +283,6 @@ class _SecurityScreenState extends State<SecurityScreen>
           '${_withoutEmoji(locationName)}. '
           'Verifica la situación y llama al 123 si requiere ayuda. Ubicación: '
           'https://maps.google.com/?q=${emergency.latitude},${emergency.longitude}';
-      _smsContactName = contactName;
       final smsUri = Uri(
         scheme: 'sms',
         path: phone,
@@ -448,6 +299,9 @@ class _SecurityScreenState extends State<SecurityScreen>
     } catch (error) {
       _showSmsError('No se pudo preparar el mensaje SMS.');
       debugPrint('No se pudo abrir el compositor SMS: $error');
+    } finally {
+      _smsIsOpening = false;
+      if (mounted) setState(() {});
     }
   }
 
@@ -466,6 +320,9 @@ class _SecurityScreenState extends State<SecurityScreen>
 
   void _showSmsError(String message) {
     if (!mounted) return;
+    setState(() {
+      _smsError = message;
+    });
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text(message)));
   }
@@ -487,7 +344,6 @@ class _SecurityScreenState extends State<SecurityScreen>
       }
       _gracePeriodTimer?.cancel();
       _gracePeriodEndsAt = null;
-      _smsWasCancelled = true;
       _protectionService.clearAlarm();
       await _deactivate();
     } catch (error) {
@@ -810,25 +666,10 @@ class _SecurityScreenState extends State<SecurityScreen>
                 ),
               ),
               const SizedBox(height: 6),
-              if (_smsIsSending)
-                const Text(
-                  'Enviando SMS de emergencia…',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.white70),
-                )
-              else if (_activeEmergency?.smsStatus == 'sent')
-                Text(
-                  '✓ SMS enviado a $_displayContactName',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    color: Color(0xFF00E6A7),
-                    fontWeight: FontWeight.w600,
-                  ),
-                )
-              else if (_smsFallbackOpened)
+              if (_smsFallbackOpened)
                 const Text(
                   'Se abrió la aplicación de mensajes con el texto listo. '
-                  'Presiona Enviar allí.',
+                  'Revisa el destinatario y pulsa Enviar allí.',
                   textAlign: TextAlign.center,
                   style: TextStyle(color: Colors.white70),
                 )
@@ -877,50 +718,28 @@ class _SecurityScreenState extends State<SecurityScreen>
                 ),
               ),
               const SizedBox(height: 12),
-              if (_activeEmergency?.smsStatus == 'sent')
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: TextButton.icon(
-                    onPressed: _prepareEmergencySms,
-                    icon: const Icon(Icons.sms_outlined, size: 18),
-                    label: const Text('Reenviar desde mi celular'),
-                  ),
-                )
-              else if (_isGracePeriodActive && !_smsAutoSendStarted)
-                SizedBox(
-                  width: double.infinity,
-                  height: 48,
-                  child: FilledButton.icon(
-                    onPressed: _smsIsSending
-                        ? null
-                        : () => _sendEmergencySms(sendNow: true),
-                    icon: _smsIsSending
-                        ? const SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                        : const Icon(Icons.send_outlined),
-                    label: const Text('Enviar ahora'),
-                    style: FilledButton.styleFrom(
-                      backgroundColor: const Color(0xFF00E6A7),
-                      foregroundColor: Colors.black,
-                    ),
-                  ),
-                )
-              else if (!_smsIsSending &&
-                  _smsAutoSendStarted &&
-                  _activeEmergency?.smsStatus != 'sent')
-                Align(
-                  alignment: Alignment.centerRight,
-                  child: TextButton.icon(
-                    onPressed: _prepareEmergencySms,
-                    icon: const Icon(Icons.sms_outlined, size: 18),
-                    label: const Text('Abrir mensaje desde mi celular'),
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: OutlinedButton.icon(
+                  onPressed: _smsIsOpening ? null : _prepareEmergencySms,
+                  icon: _smsIsOpening
+                      ? const SizedBox(
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.sms_outlined),
+                  label: Text(
+                    _smsIsOpening
+                        ? 'Abriendo mensajes…'
+                        : _isGracePeriodActive
+                        ? 'Abrir SMS ahora'
+                        : 'Abrir mensaje SMS',
                   ),
                 ),
-              if (_isGracePeriodActive || _activeEmergency?.smsStatus == 'sent')
-                const SizedBox(height: 10),
+              ),
+              if (_isGracePeriodActive) const SizedBox(height: 10),
               SizedBox(
                 width: double.infinity,
                 height: 48,

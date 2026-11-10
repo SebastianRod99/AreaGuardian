@@ -1,6 +1,6 @@
 # areaguardian
 
-A new Flutter project.
+Aplicación Flutter de seguridad y alertas comunitarias.
 
 ## Getting Started
 
@@ -16,17 +16,16 @@ For help getting started with Flutter development, view the
 [online documentation](https://docs.flutter.dev/), which offers tutorials,
 samples, guidance on mobile development, and a full API reference.
 
-## Aviso manual al contacto de emergencia
+## SMS de emergencia
 
-Al activarse una emergencia, la pantalla de seguridad ofrece **Abrir SMS para
-enviar**. La app abre el compositor de mensajes del teléfono con el número y el
-texto completo, incluida la ubicación de Google Maps. El usuario debe revisar y
-pulsar Enviar; AreaGuardian no envía SMS automáticamente ni requiere secretos
-de Twilio.
+Después de confirmar una emergencia, la app da 20 segundos para cancelarla y
+abre el compositor de SMS del teléfono con el número y la ubicación
+prellenados. El mensaje no se envía automáticamente: el usuario debe revisar
+el destinatario y pulsar Enviar. AreaGuardian no envía SMS mediante servicios
+externos ni requiere permiso Android `SEND_SMS`.
 
-Las notificaciones FCM a puestos cercanos continúan siendo automáticas. La
-pantalla mantiene los 20 segundos para cancelar la alarma. La Function de
-contacto solo registra `contactAlertStatus: manual` y no contacta al destinatario.
+Las notificaciones FCM a puestos cercanos son automáticas. Los simulacros y las
+emergencias canceladas no deben generar SMS ni encuestas.
 
 ## Encuesta post-emergencia
 
@@ -45,3 +44,21 @@ en el proyecto (puede requerir el plan Blaze). Despliega las Functions con:
 ```powershell
 firebase deploy --only functions
 ```
+
+## APK Android de release
+
+Define primero el `applicationId` definitivo en
+`android/app/build.gradle.kts` y registra en Firebase la app Android con ese
+paquete. El firmado release usa `android/key.properties` (ignorado por Git):
+
+```properties
+storeFile=../ruta/local/a/release.jks
+storePassword=...
+keyAlias=...
+keyPassword=...
+```
+
+`storeFile` puede ser una ruta absoluta o relativa a `android/`. El build
+release falla si falta alguna propiedad o la keystore; nunca usa la clave debug.
+Registra en Firebase las huellas SHA-1 y SHA-256 de esa keystore antes de probar
+Google Sign-In.

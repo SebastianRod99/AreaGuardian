@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -10,6 +11,7 @@ import 'package:areaguardian/screens/user/incoming_emergency_screen.dart';
 import 'package:areaguardian/screens/user/emergency_survey_screen.dart';
 import 'package:areaguardian/screens/map_dashboard_screen.dart';
 
+import '../firebase_options.dart';
 import 'firestore_service.dart';
 
 /// Se usa para navegar (ej. al mapa) desde fuera del árbol de widgets.
@@ -23,6 +25,7 @@ const String emergencySoundName = 'alarm';
 
 @pragma('vm:entry-point')
 Future<void> firebaseMessagingBackgroundHandler(RemoteMessage message) async {
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   debugPrint(
     '📩 Notificación de emergencia recibida en background: ${message.messageId}',
   );

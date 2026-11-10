@@ -92,7 +92,6 @@ class EmergencyAlertService {
       longitude: emergency.longitude,
       timestamp: timestamp,
       status: emergency.status,
-      smsStatus: 'failed',
     );
   }
 }

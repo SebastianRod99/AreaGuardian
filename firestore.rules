@@ -29,15 +29,7 @@ service cloud.firestore {
 
     function isValidUserProfile(userId) {
       let data = request.resource.data;
-      return data.keys().hasOnly([
-          'id', 'name', 'email', 'phone', 'isVendor', 'vendorId',
-          'latitude', 'longitude', 'lastSeen', 'emergencyContact',
-          'activeEmergencyId', 'fcmToken', 'lastLoginAt', 'appVersion',
-          'profilePhotoUrl', 'lastKnownLatitude', 'lastKnownLongitude',
-          'lastKnownLocationAt', 'consentVersion', 'consentAcceptedAt',
-          'analyticsConsent'
-        ])
-        && data.id == userId
+      return data.id == userId
         && data.name is string && data.name.size() <= 120
         && data.email is string && data.email.size() <= 254
         && data.phone is string && data.phone.size() <= 32
@@ -78,13 +70,7 @@ service cloud.firestore {
 
     function isValidVendor(vendorId) {
       let data = request.resource.data;
-      return data.keys().hasOnly([
-          'id', 'userId', 'shopName', 'address', 'vendorName', 'category',
-          'latitude', 'longitude', 'currentLatitude', 'currentLongitude',
-          'lastLocationUpdate', 'nequiNumber', 'daviplataNumber',
-          'llaveNumber', 'catalog', 'isActive', 'lastSeen', 'fcmToken'
-        ])
-        && data.id == vendorId
+      return data.id == vendorId
         && data.userId == request.auth.uid
         && data.shopName is string && data.shopName.size() > 0
         && data.shopName.size() <= 120
@@ -107,8 +93,12 @@ service cloud.firestore {
           (data.currentLongitude is number && data.currentLongitude >= -180
             && data.currentLongitude <= 180))
         && (data.get('lastLocationUpdate', null) == null ||
-          data.lastLocationUpdate is timestamp)
-        && (data.get('lastSeen', null) == null || data.lastSeen is timestamp)
+          data.lastLocationUpdate is timestamp ||
+          (data.lastLocationUpdate is string
+            && data.lastLocationUpdate.size() <= 40))
+        && (data.get('lastSeen', null) == null ||
+          data.lastSeen is timestamp ||
+          (data.lastSeen is string && data.lastSeen.size() <= 40))
         && (data.get('fcmToken', null) == null ||
           (data.fcmToken is string && data.fcmToken.size() <= 4096));
     }
@@ -210,6 +200,14 @@ service cloud.firestore {
       allow get, list: if isSelf(userId);
       allow create: if isSelf(userId)
         && uidUnchanged()
+        && request.resource.data.keys().hasOnly([
+          'id', 'name', 'email', 'phone', 'isVendor', 'vendorId',
+          'latitude', 'longitude', 'lastSeen', 'emergencyContact',
+          'activeEmergencyId', 'fcmToken', 'lastLoginAt', 'appVersion',
+          'profilePhotoUrl', 'lastKnownLatitude', 'lastKnownLongitude',
+          'lastKnownLocationAt', 'consentVersion', 'consentAcceptedAt',
+          'analyticsConsent'
+        ])
         && isValidUserProfile(userId)
         && request.resource.data.get('activeEmergencyId', null) == null
         && (!request.resource.data.isVendor
@@ -230,9 +228,21 @@ service cloud.firestore {
     match /vendors/{vendorId} {
       allow get, list: if isSelf(vendorId);
       allow create: if isSelf(vendorId)
+        && request.resource.data.keys().hasOnly([
+          'id', 'userId', 'shopName', 'address', 'vendorName', 'category',
+          'latitude', 'longitude', 'currentLatitude', 'currentLongitude',
+          'lastLocationUpdate', 'nequiNumber', 'daviplataNumber',
+          'llaveNumber', 'catalog', 'isActive', 'lastSeen', 'fcmToken'
+        ])
         && isValidVendor(vendorId)
         && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.vendorId == vendorId;
       allow update: if isSelf(vendorId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'id', 'userId', 'shopName', 'address', 'vendorName', 'category',
+          'latitude', 'longitude', 'currentLatitude', 'currentLongitude',
+          'lastLocationUpdate', 'nequiNumber', 'daviplataNumber',
+          'llaveNumber', 'catalog', 'isActive', 'lastSeen', 'fcmToken'
+        ])
         && isValidVendor(vendorId);
       allow delete: if isSelf(vendorId);
     }
@@ -246,11 +256,16 @@ service cloud.firestore {
 
     match /emergencies/{emergencyId} {
       allow get: if signedIn()
-        && (resource.data.userId == request.auth.uid
-          || isRecentEmergencyInCallerZone());
-      allow list: if signedIn()
-        && (resource.data.userId == request.auth.uid
-          || isRecentEmergencyInCallerZone());
+        && (!exists(
+          /databases/$(database)/documents/emergencies/$(emergencyId)
+        )
+          || resource.data.get('userId', null) == request.auth.uid
+          || (isVisibleToEmergencyReader()
+            && resource.data.alertVisible == true
+            && resource.data.timestamp is timestamp
+            && resource.data.timestamp >= request.time - duration.value(21, 'm')
+            && resource.data.timestamp <= request.time));
+      allow list: if signedIn() && isVisibleToEmergencyReader();
       allow create: if signedIn() && isValidEmergency(emergencyId);
       allow update: if signedIn()
         && resource.data.userId == request.auth.uid
@@ -275,6 +290,8 @@ service cloud.firestore {
       let userPath = /databases/$(database)/documents/users/$(request.auth.uid);
 
       return resource.data.get('surveyFeedback', null) == null
+        && resource.data.get('isTest', false) == false
+        && resource.data.status != 'cancelled'
         && response is map
         && responseKeys.hasOnly([
           'wasSafe', 'falseAlarm', 'receivedHelp', 'details', 'submittedAt'
@@ -302,23 +319,10 @@ service cloud.firestore {
             && !changedKeys.hasAny(['resolvedAt']));
     }
 
-    function isRecentEmergencyInCallerZone() {
-      let user = get(
-        /databases/$(database)/documents/users/$(request.auth.uid)
-      ).data;
+    function isVisibleToEmergencyReader() {
       return resource.data.status == 'active'
-        && resource.data.get('isTest', false) == false
-        && resource.data.timestamp is timestamp
-        && resource.data.timestamp >= request.time - duration.value(21, 'm')
-        && resource.data.timestamp <= request.time
-        && user.get('lastKnownLatitude', null) is number
-        && user.get('lastKnownLongitude', null) is number
-        && user.get('lastKnownLocationAt', null) is timestamp
-        && user.lastKnownLocationAt >= request.time - duration.value(24, 'h')
-        && resource.data.latitude >= user.lastKnownLatitude - 0.0035
-        && resource.data.latitude <= user.lastKnownLatitude + 0.0035
-        && resource.data.longitude >= user.lastKnownLongitude - 0.0035
-        && resource.data.longitude <= user.lastKnownLongitude + 0.0035;
+        && resource.data.isTest == false
+        && request.auth.uid in resource.data.notifiedUserIds;
     }
   }
 }

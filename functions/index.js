@@ -14,15 +14,8 @@ const messaging = getMessaging();
 const emergencyChannelId = "emergency_alerts_channel_v2";
 const emergencySoundName = "alarm";
 const emergencySurveyDelayMs = 10 * 60_000;
-const emergencyCancellationGraceMs = 20_000;
-
-function wasCancelledDuringGrace(emergency) {
-  return emergency.status === "cancelled" &&
-    emergency.timestamp instanceof Timestamp &&
-    emergency.resolvedAt instanceof Timestamp &&
-    emergency.resolvedAt.toMillis() <=
-      emergency.timestamp.toMillis() + emergencyCancellationGraceMs;
-}
+const emergencyAlertRadiusMeters = 300;
+const userLocationMaxAgeMs = 24 * 60 * 60_000;
 
 async function claimVendorNotification(emergencyRef) {
   return db.runTransaction(async (transaction) => {
@@ -40,8 +33,9 @@ async function claimVendorNotification(emergencyRef) {
     transaction.update(emergencyRef, {
       vendorNotificationStatus: "sending",
       vendorNotificationStartedAt: FieldValue.serverTimestamp(),
-      smsStatus: emergency.smsStatus || "pending",
       surveyNotificationStatus: "pending",
+      alertVisible: true,
+      notifiedUserIds: [],
       notifiedVendorIds: [],
     });
     return emergency;
@@ -71,6 +65,76 @@ function activeVendorCoordinates(vendor) {
     [vendor.latitude, vendor.longitude];
 }
 
+function longitudeRanges(longitude, latitude, radiusMeters) {
+  const longitudeScale = Math.abs(Math.cos(latitude * Math.PI / 180));
+  const delta = longitudeScale < 1e-6 ?
+    180 :
+    Math.min(radiusMeters / (111320 * longitudeScale), 180);
+  if (delta >= 180) return [{min: -180, max: 180}];
+
+  const min = longitude - delta;
+  const max = longitude + delta;
+  if (min < -180) {
+    return [
+      {min: -180, max},
+      {min: min + 360, max: 180},
+    ];
+  }
+  if (max > 180) {
+    return [
+      {min: -180, max: max - 360},
+      {min, max: 180},
+    ];
+  }
+  return [{min, max}];
+}
+
+async function findNearbyUserIds(emergency) {
+  const latitudeDelta = emergencyAlertRadiusMeters / 111320;
+  const minLatitude = Math.max(-90, emergency.latitude - latitudeDelta);
+  const maxLatitude = Math.min(90, emergency.latitude + latitudeDelta);
+  const latitude = emergency.latitude;
+  const longitude = emergency.longitude;
+  const minLocationTime = Timestamp.fromMillis(Date.now() - userLocationMaxAgeMs);
+  const candidates = new Map();
+
+  for (const range of longitudeRanges(
+    longitude,
+    latitude,
+    emergencyAlertRadiusMeters,
+  )) {
+    const snapshot = await db.collection("users")
+      .where("lastKnownLatitude", ">=", minLatitude)
+      .where("lastKnownLatitude", "<=", maxLatitude)
+      .where("lastKnownLongitude", ">=", range.min)
+      .where("lastKnownLongitude", "<=", range.max)
+      .get();
+    snapshot.docs.forEach((user) => candidates.set(user.id, user.data()));
+  }
+
+  const recipientIds = new Set([emergency.userId]);
+  [...candidates.entries()]
+    .filter(([userId, user]) => {
+      if (
+        !Number.isFinite(user.lastKnownLatitude) ||
+        !Number.isFinite(user.lastKnownLongitude) ||
+        !(user.lastKnownLocationAt instanceof Timestamp) ||
+        user.lastKnownLocationAt.toMillis() < minLocationTime.toMillis() ||
+        user.lastKnownLocationAt.toMillis() > Date.now()
+      ) {
+        return false;
+      }
+      return distanceInMeters(
+        latitude,
+        longitude,
+        user.lastKnownLatitude,
+        user.lastKnownLongitude,
+      ) <= emergencyAlertRadiusMeters;
+    })
+    .forEach(([userId]) => recipientIds.add(userId));
+  return [...recipientIds];
+}
+
 async function findNearbyVendorIds(emergency) {
   const snapshot = await db.collection("public_vendors")
     .where("isActive", "==", true)
@@ -86,7 +150,8 @@ async function findNearbyVendorIds(emergency) {
         Number(latitude || 0),
         Number(longitude || 0),
       );
-      return doc.id !== emergency.userId && distance <= 300;
+      return doc.id !== emergency.userId &&
+        distance <= emergencyAlertRadiusMeters;
     })
     .map((doc) => doc.id);
 }
@@ -163,8 +228,8 @@ exports.notifyNearbyVendorsOnEmergency = onDocumentCreated(
     }
     if (initialEmergency.isTest === true) {
       await snapshot.ref.update({
-        smsStatus: "pending",
         surveyNotificationStatus: "skipped",
+        alertVisible: false,
         notifiedVendorIds: [],
         vendorNotificationStatus: "skipped",
         vendorNotificationCompletedAt: FieldValue.serverTimestamp(),
@@ -181,7 +246,10 @@ exports.notifyNearbyVendorsOnEmergency = onDocumentCreated(
 
     try {
     // La lista enviada por el cliente no se usa para autorizar destinatarios.
-    // El backend recalcula el radio y excluye siempre al emisor.
+    // El backend calcula quién puede ver la alerta y notifica a los puestos.
+    const userIds = await findNearbyUserIds(emergency);
+    await snapshot.ref.update({notifiedUserIds: userIds});
+
     const vendorIds = await findNearbyVendorIds(emergency);
 
     if (vendorIds.length === 0) {
@@ -311,6 +379,37 @@ exports.notifyNearbyVendorsOnEmergency = onDocumentCreated(
   }
 );
 
+exports.expireEmergencyVisibility = onSchedule(
+  {
+    schedule: "every 1 minutes",
+    timeZone: "America/Bogota",
+    region: "southamerica-east1",
+    maxInstances: 1,
+  },
+  async () => {
+    const cutoff = Timestamp.fromMillis(Date.now() - 20 * 60_000);
+    const expiredAlerts = await db.collection("emergencies")
+      .where("status", "==", "active")
+      .where("isTest", "==", false)
+      .where("alertVisible", "==", true)
+      .where("timestamp", "<=", cutoff)
+      .get();
+    if (expiredAlerts.empty) return;
+
+    const writer = db.bulkWriter();
+    expiredAlerts.docs.forEach((emergency) => {
+      writer.update(emergency.ref, {
+        alertVisible: false,
+        notifiedUserIds: [],
+      });
+    });
+    await writer.close();
+    console.log(
+      `Expired alert visibility for ${expiredAlerts.size} emergencies.`,
+    );
+  }
+);
+
 async function claimEmergencySurveyReminder(emergencyRef) {
   return db.runTransaction(async (transaction) => {
     const snapshot = await transaction.get(emergencyRef);
@@ -320,7 +419,7 @@ async function claimEmergencySurveyReminder(emergencyRef) {
     if (
       emergency.surveyNotificationStatus !== "pending" ||
       emergency.isTest === true ||
-      wasCancelledDuringGrace(emergency) ||
+      emergency.status === "cancelled" ||
       !(emergency.timestamp instanceof Timestamp) ||
       emergency.timestamp.toMillis() + emergencySurveyDelayMs > Date.now() ||
       emergency.surveyFeedback
@@ -363,7 +462,7 @@ exports.sendPostEmergencySurveyReminders = onSchedule(
 
       if (
         candidate.isTest === true ||
-        wasCancelledDuringGrace(candidate) ||
+        candidate.status === "cancelled" ||
         candidate.surveyFeedback
       ) {
         await emergencyRef.update({
@@ -450,5 +549,4 @@ exports.sendPostEmergencySurveyReminders = onSchedule(
   },
 );
 
-Object.assign(exports, require("./lib/send_emergency_sms"));
 Object.assign(exports, require("./lib/delete_account"));

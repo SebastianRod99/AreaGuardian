@@ -54,17 +54,11 @@ class AppTelemetryService {
     }
   }
 
-  static Future<void> logPracticeCompleted() =>
-      _logEvent('practice_completed');
+  static Future<void> logPracticeCompleted() => _logEvent('practice_completed');
 
   static Future<void> logGuardActivated() => _logEvent('guard_activated');
 
-  static Future<void> logEmergencyCreated() =>
-      _logEvent('emergency_created');
-
-  static Future<void> logSmsSent() => _logEvent('sms_sent');
-
-  static Future<void> logSmsFailed() => _logEvent('sms_failed');
+  static Future<void> logEmergencyCreated() => _logEvent('emergency_created');
 
   static Future<void> logFalseAlarm() => _logEvent('false_alarm');
 

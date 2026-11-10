@@ -16,7 +16,10 @@ import 'services/session_service.dart';
 import 'services/app_telemetry_service.dart';
 import 'services/consent_service.dart';
 import 'screens/consent_screen.dart';
+
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'firebase_options.dart';
 
 void main() async {
   // 2. Se convierte en async
@@ -24,7 +27,7 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   // 4. Inicializa la conexión con Firebase
-  await Firebase.initializeApp();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
   final preferences = await SharedPreferences.getInstance();
   await AppTelemetryService.initialize(
     collectionEnabled: preferences.getBool('analytics_consent') ?? false,

@@ -7,18 +7,18 @@
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:967999112644:android:993e5600a4f8c030279091",
+        "mobilesdk_app_id": "1:967999112644:android:f9a6f9083226df83279091",
         "android_client_info": {
-          "package_name": "com.example.areaguardian"
+          "package_name": "com.areaguardian.app"
         }
       },
       "oauth_client": [
         {
-          "client_id": "967999112644-2sddkra4k9fh5lt1g1mi31v5ibkmkor6.apps.googleusercontent.com",
+          "client_id": "967999112644-rpadk92du3mj7901k99apn1mqu5sjqal.apps.googleusercontent.com",
           "client_type": 1,
           "android_info": {
-            "package_name": "com.example.areaguardian",
-            "certificate_hash": "d12d4242c8b842a58cbdf8ab20b6386f11e4a37e"
+            "package_name": "com.areaguardian.app",
+            "certificate_hash": "be79d31ff0cc787572af1ab26949c870470bf8cb"
           }
         },
         {

@@ -44,5 +44,16 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 
+# Local signing credentials and secrets
+**/.env
+**/.env.*
+!**/.env.example
+**/key.properties
+**/*.jks
+**/*.keystore
+**/*.p12
+**/*.pem
+**/*.key
+
 # Widget Preview related
 .widget_preview/

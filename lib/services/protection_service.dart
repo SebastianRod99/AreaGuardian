@@ -34,7 +34,6 @@ class ProtectionService extends ChangeNotifier {
   DateTime? _activationStartedAt;
   DateTime? _sustainedMotionStartedAt;
   DateTime? _lastSustainedMotionAt;
-  DateTime? _stableTiltStartedAt;
   int _sequenceGeneration = 0;
   int _protectionGeneration = 0;
   final List<_ImpactSample> _impactSamples = [];
@@ -75,10 +74,6 @@ class ProtectionService extends ChangeNotifier {
   static const double _rearmThresholdRatio = 0.75;
   static const double _activityRearmThreshold = 1.5;
   static const double _gyroscopeActivityThreshold = 1.2;
-  static const double _gyroscopeRearmThreshold = 0.6;
-  static const double _stableTiltThresholdDegrees = 20.0;
-  static const double _stableTiltAccelerationMaximum = 1.2;
-  static const double _stableTiltGyroscopeMaximum = 0.35;
   static const double _gaitMinimumIntervalSeconds = 0.28;
   static const double _gaitMaximumIntervalSeconds = 0.9;
   static const double _gaitMaximumIntervalSpreadSeconds = 0.22;
@@ -315,19 +310,6 @@ class ProtectionService extends ChangeNotifier {
       }
     }
 
-    final stableTilt =
-        tiltDegrees >= _stableTiltThresholdDegrees &&
-        userAcceleration <= _stableTiltAccelerationMaximum &&
-        gyroscopeMagnitude <= _stableTiltGyroscopeMaximum;
-    if (stableTilt) {
-      _stableTiltStartedAt ??= now;
-      if (now.difference(_stableTiltStartedAt!) >= _sustainedMotionDuration) {
-        debugPrint('Inclinación estable superior a 20 grados durante 10 s.');
-        _triggerFromMotion();
-      }
-    } else {
-      _stableTiltStartedAt = null;
-    }
   }
 
   void handleGravitySample(DateTime now, double x, double y, double z) {
@@ -497,7 +479,6 @@ class ProtectionService extends ChangeNotifier {
   void _resetSustainedMotion() {
     _sustainedMotionStartedAt = null;
     _lastSustainedMotionAt = null;
-    _stableTiltStartedAt = null;
     _motionPulseTimes.clear();
     _motionSignalBeforePrevious = null;
     _motionSignalPrevious = null;
